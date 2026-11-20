@@ -1,0 +1,4 @@
+#!/bin/sh
+# Swarm 启动器：到哪里都能跑，不依赖当前目录
+here=$(cd "$(dirname "$0")/.." && pwd)
+PYTHONPATH="$here" exec python3 -m swarm "$@"

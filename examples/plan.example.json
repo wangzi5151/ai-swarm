@@ -1,0 +1,57 @@
+{
+  "title": "局域网记账 App",
+  "tasks": [
+    {
+      "id": "t-core",
+      "title": "架构与公共层",
+      "prompt": "建立目录结构、公共类型、错误处理、配置加载。只改 src/core 与 docs/architecture.md。",
+      "read": ["**"],
+      "write": ["src/core/**", "docs/architecture.md", "README.md"],
+      "deps": [],
+      "priority": 3
+    },
+    {
+      "id": "t-data",
+      "title": "数据层",
+      "prompt": "SQLite 表结构、迁移、聚合查询。",
+      "read": ["src/core/**", "docs/**"],
+      "write": ["src/data/**"],
+      "deps": ["t-core"],
+      "priority": 2
+    },
+    {
+      "id": "t-ui",
+      "title": "界面",
+      "prompt": "账单列表、记一笔、月度统计。只改 src/ui。",
+      "read": ["src/core/**", "docs/**"],
+      "write": ["src/ui/**"],
+      "deps": ["t-core"],
+      "cmd": "aider --yes --no-auto-commits --message {prompt} {files}"
+    },
+    {
+      "id": "t-sync",
+      "title": "同步",
+      "prompt": "mDNS 发现 + 增量同步 + 冲突合并。",
+      "read": ["src/core/**", "src/data/**"],
+      "write": ["src/sync/**"],
+      "deps": ["t-core", "t-data"],
+      "agent": "cli"
+    },
+    {
+      "id": "t-tests",
+      "title": "集成测试",
+      "prompt": "端到端测试：记账 -> 同步 -> 两端一致。",
+      "read": ["**"],
+      "write": ["tests/**", "scripts/**"],
+      "deps": ["t-data", "t-ui", "t-sync"]
+    },
+    {
+      "id": "t-docs",
+      "title": "文档",
+      "prompt": "写运行方式、目录说明、已知限制。",
+      "read": ["**"],
+      "write": ["docs/**"],
+      "deps": ["t-data", "t-ui", "t-sync"]
+    }
+  ]
+}
