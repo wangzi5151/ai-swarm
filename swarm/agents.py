@@ -6,19 +6,25 @@
     http  —— OpenAI 兼容接口（本地 llama.cpp、vLLM、LM Studio、Ollama、云 API 都行）
 
 适配器只管"写文件"，改了什么由工作区比对，不依赖 agent 自己汇报。
+另外提供 run_shell()，用来跑任务声明的验收命令（verify）。
 """
 
 from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import shlex
+import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+
+from . import workspace
 
 
 class AgentError(Exception):
@@ -26,21 +32,133 @@ class AgentError(Exception):
 
 
 # --------------------------------------------------------------------------
+# 子进程：带硬超时的流式执行
+# --------------------------------------------------------------------------
+
+def _kill_tree(proc):
+    """杀掉 agent 及其子进程（aider 会再开子进程，只 kill 父进程没用）。"""
+    try:
+        if os.name == "posix":
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                proc.kill()
+        else:
+            proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=3)
+    except Exception:
+        pass
+
+
+def _run_streaming(cmd, cwd, timeout, env=None, log=None, max_lines=4000):
+    """跑一条命令，实时把输出交给 log；到点强制杀进程组。
+
+    返回 {"rc": int|None, "lines": [...], "timed_out": bool}。
+    关键点：**不等待"下一行输出"才检查超时** —— agent 一声不吭也能被砍掉。
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd, shell=True, cwd=cwd, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True, bufsize=1,
+            start_new_session=(os.name == "posix"),
+        )
+    except OSError as exc:
+        raise AgentError("启动命令失败：%s" % exc)
+    if proc.stdout is None:
+        raise AgentError("无法读取命令输出")
+
+    q = queue.Queue()
+    closed = threading.Event()
+
+    def reader():
+        try:
+            for line in iter(proc.stdout.readline, ""):
+                q.put(line)
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            closed.set()
+            q.put(None)
+
+    th = threading.Thread(target=reader, name="agent-reader", daemon=True)
+    th.start()
+    deadline = time.time() + max(1, int(timeout))
+    lines = []
+    timed_out = False
+    while True:
+        remain = deadline - time.time()
+        if remain <= 0:
+            timed_out = True
+            break
+        try:
+            item = q.get(timeout=min(remain, 0.5))
+        except queue.Empty:
+            if closed.is_set() and proc.poll() is not None:
+                break
+            continue
+        if item is None:
+            break
+        line = item.rstrip("\n").rstrip("\r")
+        if line:
+            lines.append(line)
+            if len(lines) > max_lines:
+                del lines[:len(lines) - max_lines]
+            if log is not None:
+                try:
+                    log(line[:400])
+                except Exception:
+                    pass
+    if timed_out:
+        _kill_tree(proc)
+        # 尽量收一下已经产生的输出，便于看卡在哪
+        end = time.time() + 1.0
+        while time.time() < end:
+            try:
+                item = q.get(timeout=0.05)
+            except queue.Empty:
+                break
+            if item is None:
+                break
+            if item.strip():
+                lines.append(item.rstrip("\n"))
+    else:
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_tree(proc)
+    return {"rc": proc.returncode, "lines": lines, "timed_out": timed_out}
+
+
+def run_shell(cmd, cwd, timeout=600, log=None):
+    """跑验收命令。返回 (是否成功, 输出尾部)。"""
+    res = _run_streaming(cmd, cwd, timeout, log=log)
+    text = "\n".join(res["lines"][-40:])
+    return (not res["timed_out"] and res["rc"] == 0), text
+
+
+# --------------------------------------------------------------------------
 # mock：确定性本地模拟
 # --------------------------------------------------------------------------
 
 def run_mock(ctx):
-    """按任务范围生成/补写文件，带点延时，模拟真实 agent 的耗时。"""
+    """按任务范围生成文件，生成的每个文件都保证落在 write 范围里。"""
     log = ctx["log"]
-    files = ctx["files"] or ["src/**"]
+    files = [str(f) for f in (ctx["files"] or ["**"])]
     slug = _slug(ctx["task_id"] + "-" + ctx.get("title", ""))
-    base = _scope_base(files)
     log("模拟 agent 启动：范围 %s" % ", ".join(files))
     time.sleep(0.2)
     written = []
 
     existing = [p for p in _list_files(ctx["workdir"]) if _in_scope(p, files)]
-
     if existing:
         target = existing[0]
         path = os.path.join(ctx["workdir"], target)
@@ -49,20 +167,40 @@ def run_mock(ctx):
         written.append(target)
         log("改写了 %s" % target)
     else:
-        path = os.path.join(ctx["workdir"], base, slug + ".py")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(_stub_py(slug, ctx["title"], ctx["prompt"]))
-        written.append(os.path.relpath(path, ctx["workdir"]).replace(os.sep, "/"))
-        log("新建了 %s" % written[-1])
+        target = None
+        ext = ".py"
+        for pat in files:
+            target = _target_for(pat, slug, ext)
+            if target and _in_scope(target, files):
+                break
+            target = None
+        if target is None:
+            log("⚠ 本任务没有可写的文件（范围 %s），将产生空交付" % ", ".join(files))
+        else:
+            path = os.path.join(ctx["workdir"], target)
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(_stub_py(slug, ctx["title"], ctx["prompt"]))
+            written.append(target)
+            log("新建了 %s" % target)
 
-    # 再补一个范围里的说明文件，让"多文件改动"这条路径也被覆盖到
-    note = os.path.join(ctx["workdir"], base, slug + ".md")
-    if os.path.dirname(note):
-        os.makedirs(os.path.dirname(note), exist_ok=True)
-    with open(note, "w", encoding="utf-8") as f:
-        f.write("# %s\n\n任务：%s\n\n%s\n" % (ctx["title"], ctx["task_id"], ctx["prompt"]))
-    written.append(os.path.relpath(note, ctx["workdir"]).replace(os.sep, "/"))
+    # 再补一个范围里的说明文件（只挑带通配符的范围，避免覆盖固定文件）
+    for pat in files:
+        if not any(ch in pat for ch in "*?[{"):
+            continue
+        note = _target_for(pat, slug + "-notes", ".md")
+        if not note or not _in_scope(note, files) or note in written:
+            continue
+        path = os.path.join(ctx["workdir"], note)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# %s\n\n任务：%s\n\n%s\n" % (ctx["title"], ctx["task_id"], ctx["prompt"]))
+        written.append(note)
+        break
 
     time.sleep(float(ctx.get("mock_delay", 0.4)))
     log("交付 %d 个文件" % len(written))
@@ -115,18 +253,41 @@ def _slug(text):
     return (out or "task")[:48]
 
 
-def _scope_base(files):
-    """从 'src/api/**' 推出落盘目录 'src/api'。"""
-    for pat in files or []:
-        parts = []
-        for seg in pat.replace("\\", "/").split("/"):
-            if any(ch in seg for ch in "*?["):
-                break
-            parts.append(seg)
-        base = "/".join(parts)
-        if base and base not in (".", "/"):
-            return base
-    return "src"
+def _target_for(pattern, stem, suffix=".py"):
+    """从一个 glob 推一个真正匹配它的文件路径。推不出来返回 None。"""
+    p = str(pattern or "").strip().replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    if not p or p == ".":
+        return None
+    if p.endswith("/"):
+        p += "**"
+    parts = p.split("/")
+    out = []
+    for i, seg in enumerate(parts):
+        wild = any(ch in seg for ch in "*?[{")
+        last = (i == len(parts) - 1)
+        if not wild:
+            if last:
+                if "." in seg:
+                    return "/".join(out + [seg])       # 明确写到某个文件
+                out.append(seg)
+            else:
+                out.append(seg)
+            continue
+        if not last:
+            out.append(re.sub(r"\*+", "mod", seg).replace("?", "x").replace("[", "").replace("]", ""))
+            continue
+        name = seg.replace("**", stem).replace("*", stem).replace("?", "x")
+        name = re.sub(r"\[[^\]]*\]", "", name)
+        name = name.replace("{", "").replace("}", "")
+        if not name:
+            name = stem
+        if not os.path.splitext(name)[1]:
+            name += suffix
+        out.append(name)
+        return "/".join(out)
+    return "/".join(out + [stem + suffix])
 
 
 def _list_files(root):
@@ -139,16 +300,12 @@ def _list_files(root):
 
 
 def _in_scope(path, files):
-    from .workspace import match_any
-    return match_any(path, files) if files else True
+    return workspace.match_any(path, files) if files else True
 
 
 # --------------------------------------------------------------------------
 # cli：把 prompt 交给本机任意 agent 命令
 # --------------------------------------------------------------------------
-
-DEFAULT_CLI = "{agent_cmd}"
-
 
 def run_cli(ctx):
     template = ctx.get("cmd") or os.environ.get("SWARM_AGENT_CMD")
@@ -168,8 +325,6 @@ def run_cli(ctx):
     cmd = template
     for key, val in values.items():
         cmd = cmd.replace("{" + key + "}", str(val))
-    if "{" in cmd and "}" in cmd and "SWARM" not in cmd:
-        pass
 
     env = dict(os.environ)
     env.update({
@@ -181,40 +336,18 @@ def run_cli(ctx):
         "SWARM_TASK_FILE": os.path.join(ctx["workdir"], ".swarm-task.md"),
     })
     with open(env["SWARM_TASK_FILE"], "w", encoding="utf-8") as f:
-        f.write("# %s\n\n%s\n\n## 允许改动的文件\n\n%s\n" % (values["title"], values["prompt"], values["file_list"] or "（未限定）"))
+        f.write("# %s\n\n%s\n\n## 允许改动的文件\n\n%s\n" %
+                (values["title"], values["prompt"], values["file_list"] or "（未限定）"))
 
     log("执行：%s" % cmd)
     timeout = int(ctx.get("timeout") or 1800)
-    try:
-        proc = subprocess.Popen(
-            cmd, shell=True, cwd=ctx["workdir"], env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            universal_newlines=True, bufsize=1,
-        )
-    except OSError as exc:
-        raise AgentError("启动命令失败：%s" % exc)
-
-    lines = []
-    deadline = time.time() + timeout
-    try:
-        for line in proc.stdout:
-            line = line.rstrip()
-            if line:
-                lines.append(line)
-                log(line[:400])
-            if time.time() > deadline:
-                proc.kill()
-                raise AgentError("agent 超时（%ds）" % timeout)
-        proc.wait()
-    finally:
-        try:
-            proc.stdout.close()
-        except Exception:
-            pass
-    if proc.returncode != 0:
-        tail = "\n".join(lines[-8:])
-        raise AgentError("agent 退出码 %s\n%s" % (proc.returncode, tail))
-    return lines
+    res = _run_streaming(cmd, ctx["workdir"], timeout, env=env, log=log)
+    if res["timed_out"]:
+        raise AgentError("agent 超时（%ds），已强制结束进程组" % timeout)
+    if res["rc"] != 0:
+        tail = "\n".join(res["lines"][-8:])
+        raise AgentError("agent 退出码 %s\n%s" % (res["rc"], tail))
+    return res["lines"]
 
 
 # --------------------------------------------------------------------------
@@ -232,13 +365,20 @@ HTTP_PROMPT = """你是一个在协作网络里工作的编码 agent。只输出
 要求：
 1. 只改与任务相关的文件，不要动其它文件。
 2. 输出格式（严格）：
-{{"files": {{"相对路径": "完整文件内容", ...}, "delete": ["要删除的相对路径"]}}
+{{"files": {{"相对路径": "完整文件内容", ...}}, "delete": ["要删除的相对路径"]}}
 3. 路径必须落在这些范围内：{scope}
 """
 
 
+def _norm_base(base):
+    base = (base or "").strip().rstrip("/")
+    if base and "://" not in base:
+        base = "http://" + base
+    return base
+
+
 def run_http(ctx):
-    base = (ctx.get("base_url") or os.environ.get("SWARM_LLM_BASE") or "").rstrip("/")
+    base = _norm_base(ctx.get("base_url") or os.environ.get("SWARM_LLM_BASE") or "")
     if not base:
         raise AgentError("没有配置 --llm-base（OpenAI 兼容地址）")
     if not base.endswith("/chat/completions"):
@@ -248,13 +388,18 @@ def run_http(ctx):
     log = ctx["log"]
 
     file_list = []
+    budget = 200000
     for rel in ctx.get("file_list") or []:
+        if budget <= 0:
+            file_list.append("### （其余文件因提示词体积上限被省略）")
+            break
         full = os.path.join(ctx["workdir"], rel)
         try:
             with open(full, "r", encoding="utf-8", errors="replace") as f:
-                body = f.read(20000)
+                body = f.read(min(20000, budget))
         except OSError:
             body = ""
+        budget -= len(body)
         file_list.append("### %s\n```\n%s\n```" % (rel, body))
     prompt = HTTP_PROMPT.format(
         title=ctx.get("title", ""), prompt=ctx["prompt"],
@@ -274,9 +419,13 @@ def run_http(ctx):
         headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
     )
     log("请求模型 %s" % model)
+    timeout = min(int(ctx.get("timeout") or 600), 3600)
     try:
-        with urllib.request.urlopen(req, timeout=int(ctx.get("timeout") or 600)) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(10 << 20)
+        if len(raw) >= 10 << 20:
+            raise AgentError("模型响应超过 10MB，拒绝解析")
+        body = json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise AgentError("模型接口 HTTP %s：%s" % (exc.code, exc.read()[:300]))
     except Exception as exc:
@@ -287,22 +436,37 @@ def run_http(ctx):
     if not spec:
         raise AgentError("模型没有返回可解析的 JSON：%s" % text[:200])
     written = []
-    for rel, content in (spec.get("files") or {}).items():
-        rel = rel.lstrip("/").replace("\\", "/")
-        if ".." in rel.split("/"):
+    files = spec.get("files") or {}
+    if not isinstance(files, dict):
+        raise AgentError("模型返回的 files 不是对象")
+    for rel, content in files.items():
+        safe = workspace._safe_rel(rel)
+        if safe is None:
             raise AgentError("非法路径：%s" % rel)
-        full = os.path.join(ctx["workdir"], rel)
-        os.makedirs(os.path.dirname(full) or ctx["workdir"], exist_ok=True)
+        if not isinstance(content, str):
+            raise AgentError("文件内容不是字符串：%s" % rel)
+        if len(content) > 2 << 20:
+            raise AgentError("单文件内容过大：%s" % rel)
+        full = os.path.join(ctx["workdir"], safe)
+        parent = os.path.dirname(full)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(full, "w", encoding="utf-8") as f:
             f.write(content)
-        written.append(rel)
-        log("写入 %s" % rel)
-    for rel in spec.get("delete") or []:
-        full = os.path.join(ctx["workdir"], rel)
+        written.append(safe)
+        log("写入 %s" % safe)
+    deletes = spec.get("delete") or []
+    if not isinstance(deletes, list):
+        raise AgentError("模型返回的 delete 不是数组")
+    for rel in deletes:
+        safe = workspace._safe_rel(rel)
+        if safe is None:
+            raise AgentError("非法删除路径：%s" % rel)
+        full = os.path.join(ctx["workdir"], safe)
         if os.path.isfile(full):
             os.unlink(full)
-            written.append(rel)
-            log("删除 %s" % rel)
+            written.append(safe)
+            log("删除 %s" % safe)
     return written
 
 

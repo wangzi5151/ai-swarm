@@ -8,7 +8,7 @@ hub 把大项目拆成带依赖的任务图，节点长轮询抢任务、在自�
 零第三方依赖，只用 CPython 3.8+ 标准库。
 """
 
-__version__ = "1.0.0"
-PROTO = 1
+__version__ = "1.1.0"
+PROTO = 2
 DEFAULT_PORT = 47770
 DEFAULT_DISCOVERY_PORT = 47771

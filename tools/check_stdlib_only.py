@@ -35,8 +35,15 @@ def stdlib_names():
 
 
 def first_party():
-    """项目自己的顶层模块名。"""
+    """项目自己的顶层模块名（含 tests/ 下可被 discover 导入的模块）。"""
     names = {"swarm", "tests", "tools"}
+    for sub in SCAN_DIRS:
+        base = os.path.join(ROOT, sub)
+        if not os.path.isdir(base):
+            continue
+        for entry in os.listdir(base):
+            if entry.endswith(".py"):
+                names.add(entry[:-3])
     for entry in os.listdir(ROOT):
         path = os.path.join(ROOT, entry)
         if entry.endswith(".py"):

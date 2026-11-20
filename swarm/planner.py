@@ -21,7 +21,7 @@ import hashlib
 import json
 import re
 
-DEFAULT_MODULES = ["core", "api", "ui", "storage", "service"]
+DEFAULT_MODULES = ["api", "ui", "storage", "service"]
 
 
 def _slug(text):
@@ -47,6 +47,8 @@ def parse_explicit(text):
         return None
     out = []
     for i, raw in enumerate(tasks):
+        if not isinstance(raw, dict):
+            return None
         tid = str(raw.get("id") or "t%d" % (i + 1))
         out.append({
             "id": tid,
@@ -58,6 +60,7 @@ def parse_explicit(text):
             "agent": raw.get("agent"),
             "cmd": raw.get("cmd"),
             "model": raw.get("model"),
+            "verify": raw.get("verify"),
             "priority": int(raw.get("priority") or 0),
         })
     return {"title": data.get("title"), "tasks": out}
@@ -133,6 +136,7 @@ def plan(spec, title=None, max_tasks=8, modules=None):
     for stitle, body, hint in modules_secs:
         section_map[stitle] = (body, hint)
 
+    used_ids = {"t-core"}
     for idx, name in enumerate(wanted):
         body, hint = section_map.get(name, ("", None))
         ascii_slug = re.sub(r"[^0-9a-zA-Z]+", "-", name).strip("-").lower()
@@ -140,6 +144,12 @@ def plan(spec, title=None, max_tasks=8, modules=None):
         if not scope.endswith("*") and not scope.endswith("/"):
             scope = scope.rstrip("/") + "/**"
         tid = "t-" + (ascii_slug or ("m%d" % (idx + 1)))
+        base_tid = tid
+        n = 2
+        while tid in used_ids:
+            tid = "%s-%d" % (base_tid, n)
+            n += 1
+        used_ids.add(tid)
         tasks.append({
             "id": tid,
             "title": name,
@@ -186,10 +196,33 @@ def _guess_title(spec):
 
 def validate(plan_obj):
     """补全默认值，检查依赖是否存在、是否有环。"""
+    if not isinstance(plan_obj, dict):
+        raise ValueError("计划必须是 JSON 对象")
     tasks = plan_obj.get("tasks") or []
-    ids = [t["id"] for t in tasks]
+    if not isinstance(tasks, list) or not tasks:
+        raise ValueError("计划里没有任务")
+    ids = []
+    for t in tasks:
+        if not isinstance(t, dict):
+            raise ValueError("任务必须是 JSON 对象")
+        tid = str(t.get("id") or "").strip()
+        if not tid:
+            raise ValueError("有任务缺少 id")
+        if "/" in tid or len(tid) > 120:
+            raise ValueError("任务 id 非法：%r" % tid)
+        t["id"] = tid
+        raw_deps = t.get("deps") or []
+        if not isinstance(raw_deps, list):
+            raise ValueError("任务 %s 的 deps 必须是数组" % tid)
+        t["deps"] = [str(d) for d in raw_deps]
+        try:
+            t["priority"] = int(t.get("priority") or 0)
+        except (TypeError, ValueError):
+            raise ValueError("任务 %s 的 priority 必须是整数" % tid)
+        ids.append(tid)
     if len(set(ids)) != len(ids):
-        raise ValueError("任务 id 重复")
+        dup = sorted({x for x in ids if ids.count(x) > 1})
+        raise ValueError("任务 id 重复：%s" % ", ".join(dup))
     idset = set(ids)
     for t in tasks:
         t.setdefault("read", ["**"])
@@ -198,6 +231,14 @@ def validate(plan_obj):
         t.setdefault("agent", None)
         t.setdefault("cmd", None)
         t.setdefault("model", None)
+        t.setdefault("verify", None)
+        # 任务必须能读到自己要写的文件，否则"已有文件"会被误判成"两个任务同时新建"。
+        writes = [w for w in (t.get("write") or ["**"])]
+        reads = list(t.get("read") or ["**"])
+        for w in writes:
+            if w not in reads:
+                reads.append(w)
+        t["read"] = reads
         for d in t.get("deps") or []:
             if d not in idset:
                 raise ValueError("任务 %s 依赖了不存在的 %s" % (t["id"], d))

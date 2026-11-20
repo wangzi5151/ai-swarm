@@ -53,7 +53,7 @@ def run_demo(nodes=3, keep=False, root=None):
 
     print("=" * 62)
     print(" Swarm 演示：hub 在 127.0.0.1:%d，%d 个模拟节点各自独立工作" % (port, nodes))
-    print(" 看板可以用浏览器打开  http://127.0.0.1:%d/?t=%s" % (port, hub.token[:8] + "…"))
+    print(" 看板 http://127.0.0.1:%d/   主令牌 %s" % (port, hub.token))
     print("=" * 62)
 
     node_objs = []
@@ -80,11 +80,13 @@ def run_demo(nodes=3, keep=False, root=None):
 
     seen = {}
     t0 = time.time()
-    last_pid = None
+    pid = project["id"]
     deadline = time.time() + 180
     while time.time() < deadline:
         state = hub.snapshot_state()
-        proj = state["projects"][0]
+        proj = next((p for p in state["projects"] if p["id"] == pid), None)
+        if proj is None:
+            break
         for t in proj["tasks"]:
             key = (t["id"], t["status"])
             if key != seen.get(t["id"]):
@@ -93,20 +95,22 @@ def run_demo(nodes=3, keep=False, root=None):
                 line = " %5.1fs  %-16s %-9s %s %s" % (
                     time.time() - t0, t["id"], t["status"], t["title"], who)
                 print(line)
-                last_pid = t["id"]
         if proj["status"] in ("done", "failed", "review", "cancelled"):
             break
         time.sleep(0.15)
 
     state = hub.snapshot_state()
-    proj = state["projects"][0]
+    proj = next((p for p in state["projects"] if p["id"] == pid), {"status": "missing", "tasks": []})
     print("-" * 62)
     print(" 项目状态：%s   用时 %.1fs" % (proj["status"], time.time() - t0))
     for t in proj["tasks"]:
         st = t.get("stats") or {}
         print("   %-16s %-8s 文件 %d" % (t["id"], t["status"], st.get("files", 0)))
 
-    tree = os.path.join(base, "hub", "projects", proj["id"], "tree")
+    st = state.get("stats") or {}
+    print(" 传输：上传 %.1f KB / 下载 %.1f KB（内容寻址，同文件只传一次）" % (
+        st.get("blob_in", 0) / 1024.0, st.get("blob_out", 0) / 1024.0))
+    tree = os.path.join(base, "hub", "projects", pid, "tree")
     print("\n 产出目录：%s" % tree)
     for rel in sorted(_walk(tree))[:20]:
         print("   " + rel)
@@ -125,7 +129,7 @@ def run_demo(nodes=3, keep=False, root=None):
         shutil.rmtree(base, ignore_errors=True)
         print("\n演示目录已清理（--keep 可保留）")
     ok = proj["status"] == "done"
-    print("演示%s" % ("成功 ✅" if ok else "未完成 ❌"))
+    print("演示%s" % ("成功 ✅" if ok else "未完成 ❌（%s）" % proj["status"]))
     return 0 if ok else 1
 
 

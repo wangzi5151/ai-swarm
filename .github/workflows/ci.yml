@@ -20,13 +20,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.8", "3.10", "3.12"]
+        python: ["3.8", "3.10", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+
+      - name: 准备 git 身份（部分用例会真的 git commit）
+        run: |
+          git config --global user.name "swarm-ci"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
 
       - name: 语法编译检查
         run: python -m compileall -q swarm tests tools
@@ -59,3 +65,24 @@ jobs:
 
       - name: 起 1 个 hub + 3 个节点跑完一个项目
         run: ./bin/swarm demo
+
+  bench:
+    name: 冒烟 · 调度基准
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 跑小规模任务图（只验证链路，不做性能门槛）
+        run: |
+          python tools/bench.py --tasks 12 --nodes 1 --json | tee bench.json
+          python - <<'PY'
+          import json
+          data = json.load(open("bench.json"))
+          assert data["status"] == "done", data
+          assert data["tasks"] == 12, data
+          print("基准冒烟通过：", data["seconds"], "秒")
+          PY

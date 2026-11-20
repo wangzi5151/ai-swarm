@@ -1,6 +1,7 @@
 #!/bin/sh
 # 各节点用什么 agent —— 挑一条改改就能用。
 # 用法：./bin/swarm node --discover --token XXX --agent cli --cmd '<下面某一条>'
+# 建议再加 --verify 'python3 -m compileall -q src'：验收失败的改动不会进主工程。
 
 # 1) Aider（最省事：它自己会读文件、改文件、提交）
 CMD_AIDER='aider --yes --no-auto-commits --message "{prompt}" {files}'
@@ -20,7 +21,11 @@ CMD_MINE='python3 /data/agent/mine.py "{prompt}"'
 # 6) 只认 stdin 的工具：把任务说明文件喂进去
 CMD_STDIN='cat {workdir}/.swarm-task.md | my-agent --auto'
 
-# 7) 完全交给 OpenAI 兼容接口（不用命令行 agent）
+# 7) 带验收命令的完整例子
+#    ./bin/swarm node --discover --token XXX --name 手机A --slots 2 \
+#      --agent cli --cmd "$CMD_AIDER" --verify 'python3 -m compileall -q src'
+
+# 8) 完全交给 OpenAI 兼容接口（不用命令行 agent）
 #    ./bin/swarm node --discover --token XXX --agent http \
 #      --llm-base http://127.0.0.1:11434/v1 --model qwen2.5-coder:14b
 

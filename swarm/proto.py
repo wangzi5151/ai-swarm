@@ -1,15 +1,19 @@
-"""线上协议：HMAC 鉴权、HTTP 客户端、错误类型。
+"""线上协议：HMAC 鉴权、防重放、HTTP 客户端、错误类型。
 
 约定（所有请求）：
-    X-Swarm-Ts   : 秒级时间戳
-    X-Swarm-Sig  : HMAC-SHA256(token, ts + "\\n" + METHOD + "\\n" + path + "\\n" + sha256(body))
-    X-Swarm-Node : 节点 id（加入之后）
+    X-Swarm-Ts     : 秒级时间戳
+    X-Swarm-Nonce  : 8 字节随机串（v2 起签进签名，防重放）
+    X-Swarm-Sig    : HMAC-SHA256(token, ts + "\\n" + METHOD + "\\n" + path + "\\n" + sha256(body) + "\\n" + nonce)
+    X-Swarm-Node   : 节点 id（加入之后）
+    X-Swarm-Encoding: gzip（可选，请求/响应体压缩）
 
 token 本身从不上网，只作为 HMAC 密钥 —— 局域网里抓包也拿不到口令。
+v2 把 nonce 签进签名，hub 侧还会记录见过的签名，窗口期内原样重放会被拒绝。
 """
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import hmac
 import http.client
@@ -19,11 +23,14 @@ import socket
 import threading
 import time
 import urllib.parse
+import zlib
 
 from . import PROTO
 
 MAX_SKEW = 180          # 允许的时钟偏差（秒）
 BODY_LIMIT = 64 << 20   # 单个请求体上限 64MB
+MAX_UNPACKED = 128 << 20
+GZIP_MIN = 512          # 小于这个体积不值得压缩
 
 
 class SwarmError(Exception):
@@ -31,6 +38,10 @@ class SwarmError(Exception):
 
 
 class AuthError(SwarmError):
+    pass
+
+
+class ForbiddenError(SwarmError):
     pass
 
 
@@ -42,12 +53,20 @@ def _body_digest(body: bytes) -> str:
     return hashlib.sha256(body or b"").hexdigest()
 
 
-def sign(token: str, ts: str, method: str, path: str, body: bytes) -> str:
+def _message(ts, method, path, body, nonce) -> str:
     msg = "%s\n%s\n%s\n%s" % (ts, method.upper(), path, _body_digest(body))
+    if nonce:
+        msg += "\n" + nonce
+    return msg
+
+
+def sign(token: str, ts: str, method: str, path: str, body: bytes, nonce: str = "") -> str:
+    msg = _message(ts, method, path, body, nonce)
     return hmac.new(token.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def verify(token: str, ts: str, sig: str, method: str, path: str, body: bytes) -> None:
+def verify(token: str, ts: str, sig: str, method: str, path: str, body: bytes,
+           nonce: str = "") -> None:
     if not ts or not sig:
         raise AuthError("缺少签名")
     try:
@@ -56,9 +75,45 @@ def verify(token: str, ts: str, sig: str, method: str, path: str, body: bytes) -
         raise AuthError("时间戳非法")
     if abs(time.time() - ts_i) > MAX_SKEW:
         raise AuthError("时间戳偏差过大（检查两台机器的时钟）")
-    want = sign(token, ts, method, path, body)
+    want = sign(token, ts, method, path, body, nonce)
     if not hmac.compare_digest(want, sig):
         raise AuthError("签名不匹配：token 不对，或者不是同一个 hub")
+
+
+def new_nonce() -> str:
+    return os.urandom(8).hex()
+
+
+# --------------------------------------------------------------------------
+# 压缩
+# --------------------------------------------------------------------------
+
+def compress(data):
+    if len(data) < GZIP_MIN:
+        return data, False
+    packed = gzip.compress(data, compresslevel=6, mtime=0)
+    if len(packed) >= len(data):
+        return data, False
+    return packed, True
+
+
+def decompress_limited(data, limit=MAX_UNPACKED):
+    """解压但限制上限，避免 gzip 炸弹。"""
+    if len(data) > limit:
+        raise SwarmError("压缩包过大")
+    try:
+        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        out = d.decompress(data, limit + 1)
+        if len(out) > limit:
+            raise SwarmError("解压后超过上限")
+        out += d.flush()
+    except SwarmError:
+        raise
+    except Exception as exc:
+        raise SwarmError("gzip 解压失败：%s" % exc)
+    if len(out) > limit:
+        raise SwarmError("解压后超过上限")
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -82,6 +137,11 @@ class HubClient(object):
     def _connect(self, timeout):
         conn = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
         conn.connect()
+        # 局域网小包很多，关掉 Nagle：否则每个 keep-alive 请求会多等 ~40ms
+        try:
+            conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
         return conn
 
     def _conn_for(self, timeout):
@@ -116,36 +176,43 @@ class HubClient(object):
                 pass
         self._drop()
 
-    def raw(self, method, path, body=None, timeout=None, retries=2):
+    def raw_full(self, method, path, body=None, timeout=None, retries=2, headers=None):
+        """返回 (status, data, response_headers)。"""
         body = body or b""
         timeout = timeout or self.timeout
         last = None
         for attempt in range(retries + 1):
             ts = str(int(time.time()))
-            headers = {
+            nonce = new_nonce()
+            head = {
                 "X-Swarm-Ts": ts,
-                "X-Swarm-Sig": sign(self.token, ts, method, path, body),
+                "X-Swarm-Nonce": nonce,
+                "X-Swarm-Sig": sign(self.token, ts, method, path, body, nonce),
                 "X-Swarm-Proto": str(PROTO),
                 "Content-Type": "application/json",
             }
             if self.node_id:
-                headers["X-Swarm-Node"] = self.node_id
+                head["X-Swarm-Node"] = self.node_id
+            head.update(headers or {})
             if body:
-                headers["Content-Length"] = str(len(body))
+                head["Content-Length"] = str(len(body))
             try:
                 conn = self._conn_for(timeout)
-                conn.request(method, path, body=body or None, headers=headers)
+                conn.request(method, path, body=body or None, headers=head)
                 resp = conn.getresponse()
                 data = resp.read()
                 status = resp.status
+                rh = {k.lower(): v for k, v in resp.getheaders()}
                 if status >= 500 and attempt < retries:
                     self._drop()
                     time.sleep(0.3 * (attempt + 1))
                     continue
                 if status == 401:
                     raise AuthError(_decode(data).get("error") or "鉴权失败")
-                return status, data
-            except AuthError:
+                if status == 403:
+                    raise ForbiddenError(_decode(data).get("error") or "没有权限")
+                return status, data, rh
+            except (AuthError, ForbiddenError):
                 raise
             except (http.client.HTTPException, OSError, socket.error) as exc:
                 last = exc
@@ -155,6 +222,10 @@ class HubClient(object):
                     continue
                 raise SwarmError("连不上 hub %s:%s（%s）" % (self.host, self.port, exc))
         raise SwarmError("请求失败：%s" % last)
+
+    def raw(self, method, path, body=None, timeout=None, retries=2, headers=None):
+        status, data, _rh = self.raw_full(method, path, body, timeout, retries, headers)
+        return status, data
 
     # -- 语义层 ----------------------------------------------------------
     def call(self, method, path, payload=None, timeout=None):
@@ -182,25 +253,61 @@ class HubClient(object):
     def claim(self, payload, wait=25):
         return self.call("POST", "/api/claim?wait=%d" % wait, payload, timeout=wait + 15)
 
-    def progress(self, task_id, lines):
-        return self.call("POST", "/api/progress", {"task_id": task_id, "lines": lines}, timeout=10)
+    def progress(self, task_id, lines, project=None):
+        payload = {"task_id": task_id, "lines": lines}
+        if project:
+            payload["project"] = project
+        if self.node_id:
+            payload["node_id"] = self.node_id
+        return self.call("POST", "/api/progress", payload, timeout=10)
 
     def complete(self, payload):
-        return self.call("POST", "/api/complete", payload, timeout=60)
+        if self.node_id:
+            payload.setdefault("node_id", self.node_id)
+        return self.call("POST", "/api/complete", payload, timeout=120)
 
     def fail(self, payload):
+        if self.node_id:
+            payload.setdefault("node_id", self.node_id)
         return self.call("POST", "/api/fail", payload, timeout=20)
 
-    def fetch_blob(self, sha, timeout=60):
-        status, data = self.raw("GET", "/api/blob/" + sha, timeout=timeout)
+    def has_blob(self, sha, timeout=15):
+        try:
+            res = self.get_json("/api/has/" + sha, timeout=timeout)
+        except SwarmError:
+            return False
+        return bool(res.get("exists"))
+
+    def has_blobs(self, shas, timeout=20):
+        """一次问清一批 blob 在不在 hub 上；失败返回 None（调用方按全缺处理）。"""
+        shas = [s for s in (shas or []) if s][:5000]
+        if not shas:
+            return {}
+        try:
+            res = self.call("POST", "/api/has", {"shas": shas}, timeout=timeout)
+        except Exception:
+            return None
+        return res.get("exists") or {}
+
+    def fetch_blob(self, sha, timeout=120):
+        status, data, rh = self.raw_full(
+            "GET", "/api/blob/" + sha, timeout=timeout,
+            headers={"X-Swarm-Accept": "gzip"})
         if status == 404:
             raise SwarmError("hub 上没有这个 blob：" + sha)
         if status >= 400:
             raise SwarmError("取 blob 失败 HTTP %d" % status)
+        if rh.get("x-swarm-encoding") == "gzip":
+            data = decompress_limited(data)
+        if hashlib.sha256(data).hexdigest() != sha:
+            raise SwarmError("收到的文件校验失败：" + sha)
         return data
 
-    def push_blob(self, sha, data, timeout=60):
-        status, resp = self.raw("POST", "/api/blob/" + sha, data, timeout=timeout)
+    def push_blob(self, sha, data, timeout=120):
+        payload, packed = compress(data)
+        headers = {"X-Swarm-Encoding": "gzip"} if packed else None
+        status, resp = self.raw("POST", "/api/blob/" + sha, payload,
+                                timeout=timeout, headers=headers)
         if status >= 400:
             raise SwarmError("传 blob 失败 HTTP %d" % status)
 
@@ -223,7 +330,7 @@ def parse_hub_addr(text, default_port):
     if not text:
         raise SwarmError("hub 地址为空")
     if text.startswith("["):
-        host, _, rest = text[1].partition("]")
+        host, _, rest = text[1:].partition("]")
         port = rest.lstrip(":") or default_port
         return host, int(port)
     if text.count(":") == 1:
@@ -250,7 +357,10 @@ def lan_ip():
         s.connect(("8.8.8.8", 80))
         return s.getsockname()[0]
     except Exception:
-        return "127.0.0.1"
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "127.0.0.1"
     finally:
         s.close()
 

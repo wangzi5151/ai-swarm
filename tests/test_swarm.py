@@ -56,11 +56,13 @@ class HubFixture(object):
         self.thread.start()
         self.client = HubClient("127.0.0.1", self.port, self.hub.token, timeout=30)
         self.nodes = []
+        self.fakes = []
 
     def join_fake(self, name="fake"):
         c = HubClient("127.0.0.1", self.port, self.hub.token, timeout=30)
         res = c.join({"name": name, "kinds": ["mock"], "slots": 1})
         c.node_id = res["node_id"]
+        self.fakes.append(c)
         return c
 
     def start_node(self, name, slots=1, **kw):
@@ -86,6 +88,11 @@ class HubFixture(object):
             self.srv.shutdown()
         except Exception:
             pass
+        for c in self.fakes:
+            try:
+                c.close_all()
+            except Exception:
+                pass
         self.client.close_all()
         shutil.rmtree(self.dir, ignore_errors=True)
 

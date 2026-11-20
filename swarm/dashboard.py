@@ -29,8 +29,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .stat b{font-size:20px;font-variant-numeric:tabular-nums}
   .stat span{display:block;font-size:11px;color:var(--dim)}
   table{width:100%;border-collapse:collapse;font-size:12.5px}
-  th{text-align:left;color:var(--dim);font-weight:600;padding:4px 6px;border-bottom:1px solid var(--line)}
-  td{padding:5px 6px;border-bottom:1px solid #1b2531;vertical-align:top}
   code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
   .node{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid #1b2531}
   .node:last-child{border-bottom:none}
@@ -42,14 +40,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .task .name{font-weight:600;flex:1;min-width:120px}
   .tag{font-size:11px;padding:1px 6px;border-radius:5px;border:1px solid var(--line);color:var(--dim)}
   .st-done{color:var(--ok);border-color:#1f6b34}
-  .st-running{color:var(--run);border-color:#1f4f7a}
+  .st-running,.st-preparing{color:var(--run);border-color:#1f4f7a}
   .st-queued{color:var(--dim)}
   .st-failed{color:var(--bad);border-color:#7a2222}
   .st-conflict{color:var(--warn);border-color:#7a5a1f}
+  .st-blocked{color:var(--warn);border-color:#7a5a1f;border-style:dashed}
   .st-cancelled{color:var(--idle);border-style:dashed}
   .bar{height:5px;border-radius:99px;background:#1b2531;overflow:hidden;margin-top:7px}
   .bar>i{display:block;height:100%;background:linear-gradient(90deg,#4ea1ff,#3fb950);width:0;transition:width .4s}
-  .log{color:var(--dim);font-size:11.5px;margin-top:5px;max-height:110px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+  .log{color:var(--dim);font-size:11.5px;margin-top:5px;max-height:120px;overflow:auto;white-space:pre-wrap;word-break:break-all}
   .conf{padding:6px 8px;border:1px solid #7a5a1f;border-radius:8px;margin-top:6px;font-size:12px;background:#1e1a10}
   .conf button{margin-right:6px;margin-top:6px}
   button{background:#1f2b3a;color:var(--txt);border:1px solid var(--line);border-radius:8px;
@@ -57,6 +56,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   button:active{background:#28374a}
   button.primary{background:#1c4f8a;border-color:#2a6db8}
   button.danger{background:#5c1f1f;border-color:#8a2b2b}
+  button:disabled{opacity:.45}
   input,textarea{width:100%;background:#0e141b;color:var(--txt);border:1px solid var(--line);
     border-radius:8px;padding:8px;font-size:13px;font-family:inherit}
   textarea{min-height:70px;resize:vertical}
@@ -66,9 +66,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .warnrow{color:var(--warn)}
   .errrow{color:var(--bad)}
   .right{float:right}
-  .hide{display:none}
   .foot{position:fixed;left:0;right:0;bottom:0;padding:6px 12px;background:rgba(11,15,20,.92);
     border-top:1px solid var(--line);font-size:11px;color:var(--dim);display:flex;gap:10px;justify-content:space-between}
+  #diffbox{display:none;margin-top:10px}
+  #diffpre{max-height:50vh;overflow:auto;background:#0e141b;border:1px solid var(--line);
+    border-radius:8px;padding:8px;font-size:12px;white-space:pre-wrap;word-break:break-all}
 </style>
 </head>
 <body>
@@ -93,6 +95,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <div class="card" style="margin-bottom:10px">
   <h2>项目 <span class="pill" id="projcount">0</span></h2>
   <div id="projects"><div class="muted">还没有项目。在 hub 机器上执行 <code>./swarm submit</code>，或展开下面的表单。</div></div>
+  <div id="diffbox">
+    <h2>差异 <span class="pill" id="difftitle"></span> <a href="#" class="sub" id="diffclose">关闭</a></h2>
+    <pre id="diffpre"></pre>
+  </div>
   <details style="margin-top:10px">
     <summary class="sub" style="cursor:pointer">＋ 新建项目（拆解并派发）</summary>
     <div style="margin-top:8px;display:grid;gap:8px">
@@ -113,7 +119,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script>
 (function(){
   var state = null;
-  var token = localStorage.getItem('swarm_token') || '';
+  var askedToken = false;
 
   function $(id){ return document.getElementById(id); }
   function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){
@@ -124,24 +130,32 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     opts.headers = Object.assign({'Content-Type':'application/json'}, opts.headers||{});
     return fetch(path, opts).then(function(r){
       if(r.status===401){ needToken(); throw new Error('unauthorized'); }
-      return r.json();
+      if(r.status===403){ throw new Error('forbidden'); }
+      return r.json().then(function(obj){
+        if(!r.ok){ throw new Error((obj&&obj.error)||('HTTP '+r.status)); }
+        return obj;
+      });
     });
   }
   function needToken(){
-    var t = prompt('输入 hub 启动时打印的令牌（Token）：', '');
-    if(t){ localStorage.setItem('swarm_token', t.trim()); location.href = '/?t=' + encodeURIComponent(t.trim()); }
+    if(askedToken) return;
+    askedToken = true;
+    var t = prompt('输入 hub 启动时打印的主令牌（Token）：', '');
+    if(t){ location.href = '/?t=' + encodeURIComponent(t.trim()); }
   }
 
-  var stColor = {done:'st-done', running:'st-running', queued:'st-queued',
-                 failed:'st-failed', conflict:'st-conflict', cancelled:'st-cancelled'};
-  var stName = {done:'已完成', running:'进行中', queued:'排队', failed:'失败',
-                conflict:'待裁决', cancelled:'已取消'};
+  var stColor = {done:'st-done', running:'st-running', preparing:'st-preparing',
+                 queued:'st-queued', failed:'st-failed', conflict:'st-conflict',
+                 blocked:'st-blocked', cancelled:'st-cancelled'};
+  var stName = {done:'已完成', running:'进行中', preparing:'准备中', queued:'排队',
+                failed:'失败', conflict:'待裁决', blocked:'被阻塞', cancelled:'已取消'};
+  var pjName = {running:'进行中', done:'已完成', failed:'失败/阻塞', review:'待裁决',
+                paused:'已暂停', cancelled:'已取消'};
 
   function render(s){
     state = s;
     $('hubname').textContent = s.hub.name;
     $('hubmeta').textContent = 'v' + s.hub.version + ' · 运行 ' + Math.round(s.hub.uptime) + 's';
-    // nodes
     if(!s.nodes.length){ $('nodes').innerHTML = '<div class="muted">等待节点接入…</div>'; }
     else{
       $('nodes').innerHTML = s.nodes.map(function(n){
@@ -153,11 +167,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           ' · 完成 '+n.done+' · 失败 '+n.failed+' · '+esc(n.kinds.join(','))+'</div></div></div>';
       }).join('');
     }
-    // stats
-    var run=0, q=0, done=0, fail=0, conf=0;
+    var run=0, q=0, done=0, fail=0, conf=0, blocked=0;
     s.projects.forEach(function(p){
       run += p.counts.running||0; q += p.counts.queued||0;
-      done += p.counts.done||0; fail += p.counts.failed||0; conf += p.counts.conflict||0;
+      done += p.counts.done||0; fail += p.counts.failed||0;
+      conf += p.counts.conflict||0; blocked += p.counts.blocked||0;
     });
     $('stats').innerHTML =
       '<div class="stat"><b>'+s.nodes.filter(function(n){return n.online}).length+'</b><span>在线节点</span></div>'+
@@ -165,12 +179,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       '<div class="stat"><b>'+q+'</b><span>排队</span></div>'+
       '<div class="stat"><b>'+done+'</b><span>已完成</span></div>'+
       '<div class="stat"><b>'+conf+'</b><span>待裁决</span></div>'+
-      '<div class="stat"><b>'+fail+'</b><span>失败</span></div>';
-    // projects
+      '<div class="stat"><b>'+fail+'</b><span>失败</span></div>'+
+      '<div class="stat"><b>'+blocked+'</b><span>被阻塞</span></div>';
     $('projcount').textContent = s.projects.length;
     $('projects').innerHTML = s.projects.map(renderProject).join('') ||
       '<div class="muted">还没有项目。</div>';
-    // events
     $('events').innerHTML = s.events.slice().reverse().map(function(e){
       var d = new Date(e.t*1000); var hh = ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2);
       var cls = e.lvl==='error'?'errrow':(e.lvl==='warn'?'warnrow':'');
@@ -182,15 +195,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   function renderProject(p){
     var total = p.tasks.length, done = p.counts.done||0;
     var pct = total? Math.round(done*100/total):0;
-    var html = '<div style="margin-bottom:14px">'+
-      '<div class="row" style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'+
-      '<div style="flex:1"><b>'+esc(p.title)+'</b> <span class="pill">'+esc(p.id)+'</span> '+
-      '<span class="pill">'+esc(p.status)+'</span></div>'+
-      '<button data-act="pause" data-p="'+p.id+'">暂停</button>'+
-      '<button data-act="resume" data-p="'+p.id+'">继续</button></div>'+
+    var running = p.status==='running';
+    var html = '<div style="margin-bottom:16px">'+
+      '<div class="row" style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">'+
+      '<div style="flex:1;min-width:180px"><b>'+esc(p.title)+'</b> '+
+      '<span class="pill">'+esc(p.id)+'</span> '+
+      '<span class="pill">'+esc(pjName[p.status]||p.status)+'</span></div>'+
+      (running?'<button data-act="pause" data-p="'+esc(p.id)+'">暂停</button>':
+               '<button data-act="resume" data-p="'+esc(p.id)+'">继续</button>')+
+      (p.tasks.some(function(t){return t.applied;})?
+        '<button data-act="rollback" data-p="'+esc(p.id)+'">回滚最近合并</button>':'')+
+      '</div>'+
       '<div class="bar"><i style="width:'+pct+'%"></i></div>'+
       '<div class="sub" style="margin:4px 0 8px">'+done+'/'+total+' 完成 · 排队 '+(p.counts.queued||0)+
-      ' · 冲突 '+(p.counts.conflict||0)+' · 失败 '+(p.counts.failed||0)+'</div>';
+      ' · 冲突 '+(p.counts.conflict||0)+' · 阻塞 '+(p.counts.blocked||0)+
+      ' · 失败 '+(p.counts.failed||0)+'</div>';
     p.tasks.forEach(function(t){
       var st = t.status, cls = stColor[st]||'';
       html += '<div class="task"><div class="row">'+
@@ -198,20 +217,40 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         '<span class="tag '+cls+'">'+(stName[st]||st)+'</span>'+
         (t.node? '<span class="tag">'+esc(t.node)+'</span>':'')+
         (t.attempts>1? '<span class="tag">第'+t.attempts+'次</span>':'')+
-        (st==='failed'||st==='cancelled'? '<button data-act="retry" data-p="'+p.id+'" data-t="'+t.id+'">重试</button>':'')+
+        (t.applied? '<span class="tag">合并 '+t.applied+' 文件</span>':'')+
+        ((st==='failed'||st==='cancelled')?
+          '<button data-act="retry" data-p="'+esc(p.id)+'" data-t="'+esc(t.id)+'">重试</button>':'')+
+        (t.applied? '<button data-act="rbtask" data-p="'+esc(p.id)+'" data-t="'+esc(t.id)+'">回滚</button>':'')+
         '</div>';
-      if(t.stats && t.stats.files){ html += '<div class="sub">合并 '+t.stats.files+' 个文件</div>'; }
+      if(t.blocked_by){ html += '<div class="sub warnrow">上游任务 '+esc(t.blocked_by)+
+        ' 失败，本任务不会派发（先重试上游）</div>'; }
+      if(t.verify){ html += '<div class="sub">验收：'+(t.verify.ok?'通过':'失败')+
+        ' <span class="muted">'+esc(t.verify.cmd||'')+'</span></div>'; }
       if(t.log_tail && t.log_tail.length){
         html += '<div class="log">'+t.log_tail.map(esc).join('\n')+'</div>';
       }
       (t.conflicts||[]).forEach(function(c){
         html += '<div class="conf">⚠ '+esc(c.path)+' —— '+esc(c.reason||'冲突')+
-          '<div><button data-act="theirs" data-p="'+p.id+'" data-t="'+t.id+'" data-path="'+esc(c.path)+'">用节点的版本</button>'+
-          '<button data-act="ours" data-p="'+p.id+'" data-t="'+t.id+'" data-path="'+esc(c.path)+'">保留主工程</button></div></div>';
+          '<div><button data-act="diff" data-p="'+esc(p.id)+'" data-t="'+esc(t.id)+
+          '" data-path="'+esc(c.path)+'">看差异</button>'+
+          '<button data-act="theirs" data-p="'+esc(p.id)+'" data-t="'+esc(t.id)+
+          '" data-path="'+esc(c.path)+'">用节点的版本</button>'+
+          '<button data-act="ours" data-p="'+esc(p.id)+'" data-t="'+esc(t.id)+
+          '" data-path="'+esc(c.path)+'">保留主工程</button></div></div>';
       });
       html += '</div>';
     });
     return html + '</div>';
+  }
+
+  function showDiff(pid, tid, path){
+    api('/api/diff?project='+encodeURIComponent(pid)+'&task='+encodeURIComponent(tid)+
+        '&path='+encodeURIComponent(path)).then(function(res){
+      $('diffbox').style.display='block';
+      $('difftitle').textContent = path;
+      $('diffpre').textContent = res.diff || '（没有差异）';
+      $('diffbox').scrollIntoView({behavior:'smooth', block:'nearest'});
+    }).catch(function(e){ alert('取差异失败：'+e.message); });
   }
 
   document.addEventListener('click', function(ev){
@@ -220,12 +259,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     var act = b.getAttribute('data-act');
     var pid = b.getAttribute('data-p');
     var tid = b.getAttribute('data-t');
-    var body;
-    if(act==='pause'||act==='resume'){ body = {project:pid, action:act}; }
-    else if(act==='retry'){ body = {project:pid, action:'retry', task:tid}; }
-    else { body = {project:pid, task:tid, path:b.getAttribute('data-path'), choice:act==='theirs'?'theirs':'ours'}; }
-    var url = (act==='theirs'||act==='ours') ? '/api/resolve' : '/api/control';
-    api(url, {method:'POST', body: JSON.stringify(body)}).then(refresh).catch(function(){});
+    var path = b.getAttribute('data-path');
+    if(act==='diff'){ showDiff(pid, tid, path); return; }
+    var body, url;
+    if(act==='pause'||act==='resume'){ body={project:pid, action:act}; url='/api/control'; }
+    else if(act==='retry'){ body={project:pid, action:'retry', task:tid}; url='/api/control'; }
+    else if(act==='rollback'){ body={project:pid}; url='/api/rollback'; }
+    else if(act==='rbtask'){ body={project:pid, task:tid}; url='/api/rollback'; }
+    else { body={project:pid, task:tid, path:path, choice:act==='theirs'?'theirs':'ours'}; url='/api/resolve'; }
+    b.disabled = true;
+    api(url, {method:'POST', body: JSON.stringify(body)}).then(function(){
+      b.disabled=false; refresh();
+    }).catch(function(e){ b.disabled=false; alert('操作失败：'+e.message); });
   });
 
   $('nsubmit').addEventListener('click', function(){
@@ -236,10 +281,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     var btn = this;
     api('/api/submit', {method:'POST', body: JSON.stringify({title:title||'未命名项目', spec:spec})})
       .then(function(){ $('ntitle').value=''; $('nspec').value=''; btn.disabled=false; refresh(); })
-      .catch(function(){ btn.disabled=false; });
+      .catch(function(e){ btn.disabled=false; alert('提交失败：'+e.message); });
   });
 
-  $('tokreset').addEventListener('click', function(ev){ ev.preventDefault(); localStorage.removeItem('swarm_token'); needToken(); });
+  $('tokreset').addEventListener('click', function(ev){ ev.preventDefault(); askedToken=false; needToken(); });
+  $('diffclose').addEventListener('click', function(ev){ ev.preventDefault(); $('diffbox').style.display='none'; });
 
   function refresh(){
     api('/api/state').then(render).catch(function(){
@@ -247,12 +293,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     });
   }
 
-  // 令牌可以从 URL 带一次：/?t=xxxx ，之后用 cookie 维持
-  var m = location.search.match(/[?&]t=([^&]+)/);
-  if(m){ localStorage.setItem('swarm_token', decodeURIComponent(m[1])); history.replaceState(null,'','/'); }
-
   refresh();
-  setInterval(refresh, 1500);
+  setInterval(refresh, 2000);
 })();
 </script>
 </body>
