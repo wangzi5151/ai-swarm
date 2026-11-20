@@ -78,8 +78,10 @@ jobs:
 
       - name: pip install . 后直接运行 swarm
         run: |
-          python -m pip install --no-deps --no-build-isolation .
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install .
           swarm --version
+          python -m swarm --version
           swarm plan -f examples/spec-记账app.md -o /tmp/plan.json
           python - <<'PY'
           import json
