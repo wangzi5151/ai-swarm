@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-swarm"
-version = "1.1.0"
+version = "1.2.0"
 description = "局域网多机多 agent 协同调度器：拆分任务、独立工作区、差分合并、手机看板"
 readme = "README.md"
 requires-python = ">=3.8"

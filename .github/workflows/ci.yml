@@ -66,6 +66,28 @@ jobs:
       - name: 起 1 个 hub + 3 个节点跑完一个项目
         run: ./bin/swarm demo
 
+  package:
+    name: 冒烟 · 安装成命令
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: pip install . 后直接运行 swarm
+        run: |
+          python -m pip install --no-deps --no-build-isolation .
+          swarm --version
+          swarm plan -f examples/spec-记账app.md -o /tmp/plan.json
+          python - <<'PY'
+          import json
+          plan = json.load(open("/tmp/plan.json"))
+          assert plan["tasks"], plan
+          print("plan 生成：", len(plan["tasks"]), "个任务")
+          PY
+
   bench:
     name: 冒烟 · 调度基准
     runs-on: ubuntu-22.04

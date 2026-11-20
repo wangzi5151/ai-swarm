@@ -109,6 +109,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </details>
 </div>
 
+<div class="card" style="margin-bottom:10px">
+  <h2>节点令牌 <span class="pill" id="tokcount">0</span></h2>
+  <div id="tokens" class="muted">加载中…</div>
+  <div style="display:flex;gap:6px;margin-top:8px">
+    <input id="tokname" placeholder="令牌名字，比如 手机A">
+    <button class="primary" id="tokadd">发放</button>
+  </div>
+  <div id="toknew" class="sub" style="margin-top:8px;word-break:break-all"></div>
+</div>
+
 <div class="card">
   <h2>事件</h2>
   <div id="events" class="log" style="max-height:220px"></div>
@@ -205,6 +215,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                '<button data-act="resume" data-p="'+esc(p.id)+'">继续</button>')+
       (p.tasks.some(function(t){return t.applied;})?
         '<button data-act="rollback" data-p="'+esc(p.id)+'">回滚最近合并</button>':'')+
+      '<a class="tag" style="text-decoration:none" href="/api/export?project='+
+        encodeURIComponent(p.id)+'">导出</a>'+
+      '<button class="danger" data-act="delete" data-p="'+esc(p.id)+'">删除</button>'+
       '</div>'+
       '<div class="bar"><i style="width:'+pct+'%"></i></div>'+
       '<div class="sub" style="margin:4px 0 8px">'+done+'/'+total+' 完成 · 排队 '+(p.counts.queued||0)+
@@ -221,11 +234,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         ((st==='failed'||st==='cancelled')?
           '<button data-act="retry" data-p="'+esc(p.id)+'" data-t="'+esc(t.id)+'">重试</button>':'')+
         (t.applied? '<button data-act="rbtask" data-p="'+esc(p.id)+'" data-t="'+esc(t.id)+'">回滚</button>':'')+
+        '<button data-act="log" data-p="'+esc(p.id)+'" data-t="'+esc(t.id)+'">日志</button>'+
         '</div>';
       if(t.blocked_by){ html += '<div class="sub warnrow">上游任务 '+esc(t.blocked_by)+
         ' 失败，本任务不会派发（先重试上游）</div>'; }
-      if(t.verify){ html += '<div class="sub">验收：'+(t.verify.ok?'通过':'失败')+
-        ' <span class="muted">'+esc(t.verify.cmd||'')+'</span></div>'; }
+      if(t.feedback){
+        html += '<details><summary class="sub" style="cursor:pointer">上次失败反馈（重试会带给 agent）</summary>'+
+          '<div class="log">'+esc(t.feedback)+'</div></details>';
+      }
+      if(t.verify){
+        html += '<div class="sub">验收：'+(t.verify.ok?'通过':'失败')+
+          ' <span class="muted">'+esc(t.verify.cmd||'')+'</span>';
+        if(!t.verify.ok){ html += '<button data-act="log" data-p="'+esc(p.id)+
+            '" data-t="'+esc(t.id)+'">看完整输出</button>'; }
+        html += '</div>';
+      }
       if(t.log_tail && t.log_tail.length){
         html += '<div class="log">'+t.log_tail.map(esc).join('\n')+'</div>';
       }
@@ -241,6 +264,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       html += '</div>';
     });
     return html + '</div>';
+  }
+
+  function showLog(pid, tid){
+    api('/api/tasklog?project='+encodeURIComponent(pid)+'&task='+encodeURIComponent(tid))
+      .then(function(res){
+        $('diffbox').style.display='block';
+        $('difftitle').textContent = res.id+' · '+res.title+' · '+res.status;
+        var out = [];
+        (res.changes||[]).forEach(function(c){ out.push((c.deleted?'删除 ':'改动 ')+c.path); });
+        (res.conflicts||[]).forEach(function(c){ out.push('冲突 '+c.path+'：'+(c.reason||'')); });
+        if(res.verify){ out.push('验收 '+(res.verify.ok?'通过':'失败')+'：'+(res.verify.cmd||''));
+          if(!res.verify.ok && res.verify.out){ out.push('--- 验收输出 ---', res.verify.out); } }
+        out.push('--- 日志 ---');
+        out = out.concat(res.log||[]);
+        $('diffpre').textContent = out.join('\n') || '（没有日志）';
+        $('diffbox').scrollIntoView({behavior:'smooth', block:'nearest'});
+      }).catch(function(e){ alert('取日志失败：'+e.message); });
   }
 
   function showDiff(pid, tid, path){
@@ -261,11 +301,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     var tid = b.getAttribute('data-t');
     var path = b.getAttribute('data-path');
     if(act==='diff'){ showDiff(pid, tid, path); return; }
+    if(act==='log'){ showLog(pid, tid); return; }
+    if(act==='delete'){
+      if(!confirm('删除项目 '+pid+'？项目目录会一起删掉，已合并的产出也会没（建议先导出）。')) return;
+    }
     var body, url;
     if(act==='pause'||act==='resume'){ body={project:pid, action:act}; url='/api/control'; }
     else if(act==='retry'){ body={project:pid, action:'retry', task:tid}; url='/api/control'; }
     else if(act==='rollback'){ body={project:pid}; url='/api/rollback'; }
     else if(act==='rbtask'){ body={project:pid, task:tid}; url='/api/rollback'; }
+    else if(act==='delete'){ body={project:pid}; url='/api/delete'; }
     else { body={project:pid, task:tid, path:path, choice:act==='theirs'?'theirs':'ours'}; url='/api/resolve'; }
     b.disabled = true;
     api(url, {method:'POST', body: JSON.stringify(body)}).then(function(){
@@ -287,10 +332,51 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   $('tokreset').addEventListener('click', function(ev){ ev.preventDefault(); askedToken=false; needToken(); });
   $('diffclose').addEventListener('click', function(ev){ ev.preventDefault(); $('diffbox').style.display='none'; });
 
+  function renderTokens(list){
+    $('tokcount').textContent = list.length;
+    if(!list.length){ $('tokens').innerHTML = '<span class="muted">还没有节点令牌。建议每台机器单独发一个。</span>'; return; }
+    $('tokens').innerHTML = list.map(function(t){
+      return '<div class="node"><span class="dot '+(t.revoked?'':'on')+'"></span>'+
+        '<div style="flex:1"><b>'+esc(t.name)+'</b> <span class="sub">'+
+        (t.revoked?'已吊销':'有效')+' · 节点 '+(t.node?esc(t.node):'首次连接时绑定')+
+        ' · '+esc(t.hint)+'</span></div>'+
+        (t.revoked?'':'<button class="danger" data-tok="'+esc(t.name)+'">吊销</button>')+
+        '</div>';
+    }).join('');
+  }
+
+  function refreshTokens(){
+    api('/api/tokens').then(function(r){ renderTokens(r.tokens||[]); }).catch(function(){});
+  }
+
+  $('tokadd').addEventListener('click', function(){
+    var name = $('tokname').value.trim();
+    if(!name){ alert('给这个令牌起个名字（比如 手机A）'); return; }
+    var btn = this; btn.disabled = true;
+    api('/api/tokens', {method:'POST', body: JSON.stringify({action:'create', name:name})})
+      .then(function(res){
+        $('toknew').innerHTML = '新令牌 <b>'+esc(res.name)+'</b>（只显示这一次）：<br><code>'+
+          esc(res.token)+'</code>';
+        $('tokname').value=''; btn.disabled=false; refreshTokens();
+      }).catch(function(e){ btn.disabled=false; alert('发放失败：'+e.message); });
+  });
+
+  document.addEventListener('click', function(ev){
+    var b = ev.target.closest ? ev.target.closest('button[data-tok]') : null;
+    if(!b) return;
+    if(!confirm('吊销令牌 '+b.getAttribute('data-tok')+'？那台机器下次请求就失效。')) return;
+    b.disabled = true;
+    api('/api/tokens', {method:'POST', body: JSON.stringify({
+      action:'revoke', key:b.getAttribute('data-tok')})})
+      .then(function(){ refreshTokens(); })
+      .catch(function(e){ b.disabled=false; alert('吊销失败：'+e.message); });
+  });
+
   function refresh(){
     api('/api/state').then(render).catch(function(){
       $('conn').textContent = '未连接 / 需要令牌';
     });
+    refreshTokens();
   }
 
   refresh();

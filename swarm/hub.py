@@ -28,6 +28,8 @@ import json
 import os
 import re
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -47,15 +49,19 @@ from .store import BlobStore, is_sha, sha256_bytes, sha256_file
 
 EVENT_KEEP = 500
 LOG_KEEP = 400
+LOG_PERSIST = 120          # state.json 里每个任务最多留这么多行，避免文件无限膨胀
 MAX_SPEC = 500 << 10
 MAX_IMPORT = 128 << 20
+MAX_CHANGES = 5000
+MERGE_KEEP = 200
 
 
 class Hub(object):
     def __init__(self, root, name=None, token=None, port=DEFAULT_PORT, bind="0.0.0.0",
                  discovery_port=DEFAULT_DISCOVERY_PORT, lease=180, stale_after=25,
                  max_attempts=2, use_git=True, verbose=True, allow_empty=False,
-                 session_ttl=12 * 3600):
+                 session_ttl=12 * 3600, auto_merge=False, tls=False,
+                 tls_cert=None, tls_key=None):
         self.root = os.path.abspath(root)
         os.makedirs(self.root, exist_ok=True)
         self.port = int(port)
@@ -69,6 +75,11 @@ class Hub(object):
         self.verbose = verbose
         self.allow_empty = bool(allow_empty)
         self.session_ttl = max(60, int(session_ttl))
+        self.auto_merge = bool(auto_merge)
+        self.tls = bool(tls) or bool(tls_cert)
+        self.tls_cert = os.path.abspath(tls_cert) if tls_cert else None
+        self.tls_key = os.path.abspath(tls_key) if tls_key else None
+        self.tls_fingerprint = None
 
         os.makedirs(os.path.join(self.root, "projects"), exist_ok=True)
         self.blobs = BlobStore(os.path.join(self.root, "blobs"))
@@ -84,6 +95,8 @@ class Hub(object):
         self._dirty = False
         self._snap_index = {}     # project id -> {(path,size,mtime): sha}
         self._snap_lock = threading.RLock()
+        self._snap_saved = {}     # project id -> 上次落盘时间
+        self._snap_dirty = set()
         self._ignore_cache = {}   # project id -> (loaded_at, IgnoreRules)
         self.stats = {"claimed": 0, "done": 0, "failed": 0, "conflicts": 0,
                       "blob_in": 0, "blob_out": 0}
@@ -96,6 +109,7 @@ class Hub(object):
         self._seen_sigs = {}
         self._requests = {}
         self._requests_lock = threading.Lock()
+        self.body_slots = threading.BoundedSemaphore(2)   # 大请求体并发上限，防内存被顶爆
         self.tokens = self._load_tokens()
         self._server = None
         self._threads = []
@@ -348,16 +362,28 @@ class Hub(object):
             raw_projects = data.get("projects") or {}
             if not isinstance(raw_projects, dict):
                 raw_projects = {}
-            for pid, p in raw_projects.items():
+            for pid, p in list(raw_projects.items()):
                 if not isinstance(p, dict):
                     continue
-                if not p.get("tree"):
-                    p["tree"] = os.path.join(self.root, "projects", pid, "tree")
+                if not re.match(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$", str(pid)) \
+                        or ".." in str(pid):
+                    raw_projects.pop(pid, None)
+                    self.log("状态里有非法项目 id，已忽略：%r" % (pid,), "warn")
+                    continue
+                if p.get("status") == "creating":
+                    # 建项目的半路上断电：没有任务，直接丢弃，避免重启后出现空项目
+                    raw_projects.pop(pid, None)
+                    self.log("丢弃未创建完成的项目 %s" % pid, "warn")
+                    continue
+                # 树路径跟着数据目录走：备份恢复到新机器/新目录后仍然指得对
+                p["tree"] = os.path.join(self.root, "projects", pid, "tree")
                 p.setdefault("title", pid)
                 p.setdefault("spec", "")
                 p.setdefault("created", time.time())
-                p.setdefault("order", [])
-                p.setdefault("tasks", {})
+                if not isinstance(p.get("order"), list):
+                    p["order"] = []
+                if not isinstance(p.get("tasks"), dict):
+                    p["tasks"] = {}
                 p["status"] = str(p.get("status") or "running")
                 if p["status"] in ("done", "failed", "review", "cancelled", "paused"):
                     pass
@@ -391,11 +417,24 @@ class Hub(object):
                     t.setdefault("verify", None)
                     t.setdefault("committing", False)
                     t.setdefault("priority", 0)
+                    t.setdefault("feedback", None)
+                    t.setdefault("discarded", [])
+                    t.setdefault("status", "queued")
+                    t.setdefault("blocked_by", None)
+                    t.setdefault("committing_since", 0)
+                    for key in ("log", "changes", "conflicts", "applied_record", "discarded"):
+                        if not isinstance(t.get(key), list):
+                            t[key] = []
+                    if not isinstance(t.get("base"), dict):
+                        t["base"] = {}
+                    if t.get("verify") is not None and not isinstance(t["verify"], dict):
+                        t["verify"] = None
                     if t["status"] in ("running", "preparing"):
                         t["status"] = "queued"
                         t["node"] = None
                         t["lease"] = 0
                         t["committing"] = False
+                        t["base"] = {}
                 order = [tid for tid in p["order"] if tid in p["tasks"]]
                 for tid in p["tasks"]:
                     if tid not in order:
@@ -411,15 +450,47 @@ class Hub(object):
                 else:
                     self._finalize_locked(p)
             self.projects = raw_projects
+            raw_merges = data.get("merges") or []
+            if isinstance(raw_merges, list):
+                for item in raw_merges[-MERGE_KEEP:]:
+                    if isinstance(item, dict) and item.get("project") and item.get("task"):
+                        self.merges.append(item)
         self.log("恢复 %d 个项目的状态" % len(self.projects))
 
     def _save_state(self):
         with self.cond:
+            projects = {}
+            for pid, p in self.projects.items():
+                tasks = {}
+                for tid, t in p["tasks"].items():
+                    nt = dict(t)
+                    log = t.get("log") or []
+                    if len(log) > LOG_PERSIST:
+                        nt["log"] = log[-LOG_PERSIST:]
+                    changes = t.get("changes") or []
+                    if len(changes) > 200:
+                        nt["changes"] = changes[-200:]
+                    applied = t.get("applied_record") or []
+                    if len(applied) > 2000:
+                        nt["applied_record"] = applied[-2000:]
+                    discarded = t.get("discarded") or []
+                    if len(discarded) > 200:
+                        nt["discarded"] = discarded[-200:]
+                    verify = t.get("verify")
+                    if isinstance(verify, dict) and len(str(verify.get("out") or "")) > 2000:
+                        nt["verify"] = {"cmd": verify.get("cmd"), "ok": bool(verify.get("ok")),
+                                        "out": str(verify.get("out"))[:2000] + "…"}
+                    tasks[tid] = nt
+                np = dict(p)
+                np["tasks"] = tasks
+                np.pop("_order", None)
+                projects[pid] = np
             blob = json.dumps({
                 "proto": PROTO,
                 "hub": self.name,
                 "saved": time.time(),
-                "projects": self.projects,
+                "projects": projects,
+                "merges": list(self.merges)[-MERGE_KEEP:],
             }, ensure_ascii=False)
         with self._save_lock:
             path = self._state_path()
@@ -527,6 +598,8 @@ class Hub(object):
                     "applied_record": [],
                     "committing": False,
                     "verify": raw.get("verify"),
+                    "feedback": None,
+                    "discarded": [],
                     "stats": {},
                     "base": {},
                 }
@@ -535,6 +608,7 @@ class Hub(object):
                 self.projects.pop(pid, None)
                 self._touch()
                 self.cond.notify_all()
+            shutil.rmtree(os.path.join(self.root, "projects", pid), ignore_errors=True)
             raise
 
         with self.cond:
@@ -746,6 +820,8 @@ class Hub(object):
         t["changes"] = []
         t["conflicts"] = []
         t["log"] = []
+        t["base"] = {}
+        t["committing"] = False
         self._touch()
         self.cond.notify_all()
 
@@ -758,6 +834,56 @@ class Hub(object):
             rules = workspace.load_ignores(tree)
             self._ignore_cache[pid] = (now, rules)
             return rules
+
+    # -- 快照哈希索引：重启 hub 也不用把整个仓库重新哈希一遍 ------------
+    def _index_path(self, pid):
+        return os.path.join(self.root, "projects", pid, "snapshot-index.json")
+
+    def _snap_index_for(self, pid):
+        with self._snap_lock:
+            index = self._snap_index.get(pid)
+            if index is not None:
+                return index
+            index = {}
+            path = self._index_path(pid)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+            except (OSError, ValueError):
+                raw = {}
+            if isinstance(raw, dict):
+                for key, sha in raw.items():
+                    if not is_sha(sha):
+                        continue
+                    parts = str(key).split("\x00")
+                    if len(parts) != 3:
+                        continue
+                    try:
+                        index[(parts[0], int(parts[1]), int(parts[2]))] = sha
+                    except ValueError:
+                        continue
+            self._snap_index[pid] = index
+            return index
+
+    def _save_snap_index(self, pid):
+        with self._snap_lock:
+            index = self._snap_index.get(pid)
+            if not index:
+                return
+            raw = {}
+            for (rel, size, mtime), sha in index.items():
+                raw["%s\x00%d\x00%d" % (rel, size, mtime)] = sha
+        path = self._index_path(pid)
+        tmp = path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(raw, f, ensure_ascii=False)
+            os.replace(tmp, path)
+            self._snap_saved[pid] = time.time()
+            self._snap_dirty.discard(pid)
+        except OSError:
+            pass
 
     def _prepare_and_start(self, pid, tid, nid):
         with self.cond:
@@ -774,12 +900,18 @@ class Hub(object):
             tree = p["tree"]
         ignore = self._ignores_for(pid, tree)
         try:
+            # 用一份索引副本算哈希（不在锁里做 IO），算完再把新条目合并回去，
+            # 避免和 janitor 落盘索引并发修改同一个 dict。
             with self._snap_lock:
-                index = self._snap_index.setdefault(pid, {})
-                entries = workspace.snapshot(tree, self.blobs, patterns=patterns,
-                                             index=index, ignore=ignore)
-                if len(index) > 20000:
+                index = dict(self._snap_index_for(pid))
+            entries = workspace.snapshot(tree, self.blobs, patterns=patterns,
+                                         index=index, ignore=ignore)
+            with self._snap_lock:
+                target = self._snap_index.setdefault(pid, {})
+                target.update(index)
+                if len(target) > 20000:
                     self._snap_index[pid] = {}
+                self._snap_dirty.add(pid)
         except Exception as exc:
             self._requeue(pid, tid, "生成任务快照失败：%s" % exc)
             raise SwarmError("生成任务快照失败：%s" % exc)
@@ -820,6 +952,7 @@ class Hub(object):
                     "cmd": t.get("cmd"),
                     "model": t.get("model"),
                     "verify": t.get("verify"),
+                    "feedback": t.get("feedback"),
                 },
                 "snapshot": entries,
                 "server_time": now,
@@ -849,6 +982,7 @@ class Hub(object):
             t["status"] = "queued"
             t["node"] = None
             t["lease"] = 0
+            t["base"] = {}
             if burn_attempt:
                 t.setdefault("log", []).append("!! " + str(reason)[:300])
             if nid and nid in self.nodes:
@@ -887,10 +1021,18 @@ class Hub(object):
             raise ForbiddenError("这个令牌只属于节点 %s" % ident["node"])
         payload = payload or {}
         lines = payload.get("lines") or []
+        if not isinstance(lines, list):
+            raise SwarmError("lines 必须是数组")
+        try:
+            attempt = int(payload["attempt"]) if payload.get("attempt") is not None else None
+        except (TypeError, ValueError):
+            raise SwarmError("attempt 必须是整数")
         with self.cond:
             pid, p, t = self._locate(payload)
             if t.get("node") != nid or t["status"] not in ("preparing", "running"):
                 return {"ok": False, "reason": "任务已不在你手上"}
+            if attempt is not None and attempt != int(t.get("attempts") or 0):
+                return {"ok": False, "reason": "这次尝试已过期"}
             t["log"].extend(str(x)[:300] for x in list(lines)[:50])
             if len(t["log"]) > LOG_KEEP:
                 del t["log"][:len(t["log"]) - LOG_KEEP]
@@ -907,11 +1049,19 @@ class Hub(object):
             changes = []
         if not isinstance(changes, list):
             raise SwarmError("changes 必须是数组")
+        if len(changes) > MAX_CHANGES:
+            raise SwarmError("单次交付的文件太多（上限 %d 个）" % MAX_CHANGES)
         try:
             attempt = int(payload["attempt"]) if payload.get("attempt") is not None else None
         except (TypeError, ValueError):
             raise SwarmError("attempt 必须是整数")
         verify = payload.get("verify") if isinstance(payload.get("verify"), dict) else None
+        if verify is not None:
+            verify = {
+                "cmd": str(verify.get("cmd") or "")[:500],
+                "ok": bool(verify.get("ok")),
+                "out": str(verify.get("out") or "")[:8000],
+            }
         failed = False
 
         # 合并写与状态锁分开：merge_lock -> cond，顺序全局一致
@@ -945,7 +1095,7 @@ class Hub(object):
                 elif not changes and not self.allow_empty:
                     err = "空交付：agent 没有产生任何改动"
                 if not err:
-                    for ch in changes[:2000]:
+                    for ch in changes:
                         if not isinstance(ch, dict):
                             err = "changes 里有非对象条目"
                             break
@@ -966,13 +1116,13 @@ class Hub(object):
                         pid2, p2, t2 = self._locate(payload)
                     except SwarmError:
                         raise
-                    t2["committing"] = False
-                    t2["status"] = "conflict"
-                    t2["conflicts"] = [{"path": "?", "reason": "合并异常：%s" % exc}]
-                    t2["ended"] = time.time()
-                    t2["lease"] = 0
-                    self._bump("conflicts")
-                    self._finalize_locked(p2)
+                    records = list(t2.get("applied_record") or [])
+                    t2["applied_record"] = []
+                    restored = self._restore_records(p2["tree"], records)
+                    if restored:
+                        t2.setdefault("log", []).append(
+                            "↩ 合并异常，已撤销本次已写入的 %d 个文件" % restored)
+                    self._finish_failed_locked(p2, t2, nid, "合并异常：%s" % exc, None)
                     self._touch()
                     self.cond.notify_all()
                 raise SwarmError("合并异常：%s" % exc)
@@ -993,6 +1143,7 @@ class Hub(object):
                     self._bump("conflicts")
                 else:
                     t2["status"] = "done"
+                    t2["feedback"] = None
                     self._bump("done")
                     self._unblock_dependents_locked(p2)
                     node = self.nodes.get(nid)
@@ -1003,8 +1154,9 @@ class Hub(object):
                     node["running"] = [
                         r for r in node.get("running") or []
                         if not (r.get("project") == pid2 and r.get("task") == t2["id"])]
-                self.merges.append({"project": pid2, "task": t2["id"],
-                                    "time": time.time(), "applied": len(applied)})
+                if applied:
+                    self.merges.append({"project": pid2, "task": t2["id"],
+                                        "time": time.time(), "applied": len(applied)})
                 self._finalize_locked(p2)
                 self._touch()
                 self.cond.notify_all()
@@ -1024,8 +1176,15 @@ class Hub(object):
             raise ForbiddenError("这个令牌只属于节点 %s" % ident["node"])
         payload = payload or {}
         err = str(payload.get("error") or "未知错误")[:2000]
+        try:
+            attempt = int(payload["attempt"]) if payload.get("attempt") is not None else None
+        except (TypeError, ValueError):
+            raise SwarmError("attempt 必须是整数")
         with self.cond:
             pid, p, t = self._locate(payload)
+            if attempt is not None and attempt != int(t.get("attempts") or 0):
+                # 迟到的失败回报不能把已经重派的新一次尝试打掉
+                return {"ok": True, "status": t["status"], "stale": True}
             if t.get("node") != nid:
                 if t["status"] in ("done", "failed", "conflict", "blocked", "queued", "cancelled"):
                     return {"ok": True, "status": t["status"], "stale": True}
@@ -1043,6 +1202,12 @@ class Hub(object):
             del t["log"][:len(t["log"]) - LOG_KEEP]
         if verify is not None:
             t["verify"] = verify
+        feedback = str(err)
+        if isinstance(verify, dict) and verify.get("ok") is False:
+            out = str(verify.get("out") or "").strip()
+            if out:
+                feedback += "\n\n验收命令输出（%s）：\n%s" % (verify.get("cmd") or "verify", out)
+        t["feedback"] = feedback[:6000]
         t["committing"] = False
         t["lease"] = 0
         t["ended"] = time.time()
@@ -1063,6 +1228,7 @@ class Hub(object):
         else:
             t["status"] = "queued"
             t["node"] = None
+            t["base"] = {}
             self.log("任务 %s/%s 失败，重排队（第 %d 次失败，第 %d 次派发）" %
                      (p["id"], t["id"], t["fails"], int(t["attempts"])), "warn")
         self._finalize_locked(p)
@@ -1094,6 +1260,21 @@ class Hub(object):
                 t.setdefault("log", []).append("↻ 上游已恢复，任务重新排队")
                 changed = True
         return changed
+
+    def _cancel_tasks_locked(self, p):
+        for t in p["tasks"].values():
+            if t["status"] not in ("queued", "running", "preparing", "blocked"):
+                continue
+            nid = t.get("node")
+            if nid and nid in self.nodes:
+                self.nodes[nid]["running"] = [
+                    r for r in self.nodes[nid].get("running") or []
+                    if not (r.get("project") == p["id"] and r.get("task") == t["id"])]
+            t["status"] = "cancelled"
+            t["node"] = None
+            t["lease"] = 0
+            t["committing"] = False
+            t["base"] = {}
 
     def _finalize_locked(self, p):
         if p.get("status") in ("paused", "cancelled"):
@@ -1141,9 +1322,90 @@ class Hub(object):
         except OSError:
             return None
 
+    def _restore_records(self, tree, records):
+        """按 applied_record 反向恢复文件（合并异常/回滚共用）。"""
+        restored = 0
+        for r in reversed(list(records or [])):
+            path = workspace._safe_rel(r.get("path"))
+            if not path:
+                continue
+            err = None
+            if r.get("prev"):
+                err = workspace.apply_change(
+                    tree, {"path": path, "sha": r["prev"], "deleted": False,
+                           "mode": r.get("prev_mode")}, self.blobs)
+            else:
+                dest = os.path.join(tree, path)
+                try:
+                    if os.path.isfile(dest):
+                        os.unlink(dest)
+                        workspace._prune_empty(os.path.dirname(dest), tree)
+                except OSError as exc:
+                    err = str(exc)
+            if not err:
+                restored += 1
+        return restored
+
+    def _blob_bytes(self, sha):
+        if not sha or not self.blobs.has(sha):
+            return None
+        try:
+            return self.blobs.get(sha)
+        except OSError:
+            return None
+
+    @staticmethod
+    def _tree_mode(tree, path):
+        try:
+            return os.stat(os.path.join(tree, path)).st_mode & 0o777
+        except OSError:
+            return 0o644
+
+    def _file_bytes(self, tree, path):
+        full = os.path.join(tree, path)
+        try:
+            if not os.path.isfile(full):
+                return None
+            with open(full, "rb") as f:
+                return f.read()
+        except OSError:
+            return None
+
+    def _try_auto_merge(self, tree, path, base_sha, cur_sha, their_sha):
+        """两边改了同一文件的不同区域时自动合并；重叠就返回 None 交给人。"""
+        limit = 4 << 20
+        if self.blobs.size(base_sha) > limit or self.blobs.size(their_sha) > limit:
+            return None
+        full = os.path.join(tree, path)
+        try:
+            if os.path.getsize(full) > limit:
+                return None
+        except OSError:
+            return None
+        b = self._blob_bytes(base_sha)
+        o = self._file_bytes(tree, path)
+        t = self._blob_bytes(their_sha)
+        if b is None or o is None or t is None:
+            return None
+        if workspace.is_binary(b) or workspace.is_binary(o) or workspace.is_binary(t):
+            return None
+        try:
+            merged = workspace.merge3(b.decode("utf-8"), o.decode("utf-8"), t.decode("utf-8"))
+        except UnicodeDecodeError:
+            return None
+        if merged is None:
+            return None
+        new_sha = self.blobs.put_bytes(merged.encode("utf-8"))
+        if new_sha == cur_sha:
+            return None
+        err = workspace.apply_change(tree, {"path": path, "sha": new_sha}, self.blobs)
+        if err:
+            return None
+        return new_sha
+
     def _apply_changes(self, p, t, changes):
         tree = p["tree"]
-        base = t.get("base") or {}
+        base = dict(t.get("base") or {})
         try:
             ignore = self._ignores_for(p["id"], tree)
         except Exception:
@@ -1151,77 +1413,105 @@ class Hub(object):
         applied = []
         conflicts = []
         seen = set()
+
+        def record(item):
+            applied.append(item)
+            # 边应用边记账：即使后面某条改动抛异常，前面的也能被 rollback 恢复
+            t.setdefault("applied_record", []).append(item)
+
+        def conflict(path, reason, theirs=None, old=None, cur=None, **extra):
+            item = {"path": path, "reason": reason, "theirs": theirs,
+                    "base": old, "current": cur}
+            item.update(extra)
+            conflicts.append(item)
+
         for ch in changes:
-            if not isinstance(ch, dict):
-                conflicts.append({"path": "?", "reason": "改动条目不是对象"})
-                continue
-            raw = str(ch.get("path") or "").strip()
-            path = raw.replace("\\", "/")
-            while path.startswith("./"):
-                path = path[2:]
-            safe = workspace._safe_rel(path)
-            if safe is None:
-                conflicts.append({"path": raw or "?", "reason": "非法路径"})
-                continue
-            path = safe
-            if path in seen:
-                conflicts.append({"path": path, "reason": "同一交付里重复出现"})
-                continue
-            seen.add(path)
-            if ignore is not None and path != ".gitignore" and ignore.ignores(path):
-                conflicts.append({"path": path, "reason": "路径被项目 .gitignore 忽略",
-                                  "theirs": ch.get("sha"), "base": base.get(path),
-                                  "current": self._tree_sha(tree, path)})
-                continue
-            if not workspace.match_any(path, t["write"]):
-                conflicts.append({
-                    "path": path,
-                    "reason": "越界修改：不在任务范围内 %s" % ", ".join(t["write"]),
-                    "theirs": ch.get("sha"), "base": base.get(path),
-                    "current": workspace.tree_sha(tree, path), "out_of_scope": True,
-                })
-                continue
-            cur = self._tree_sha(tree, path)
-            old = base.get(path)
-            if ch.get("deleted") is True:
-                if cur is None:
+            try:
+                if not isinstance(ch, dict):
+                    conflict("?", "改动条目不是对象")
+                    continue
+                raw = str(ch.get("path") or "").strip()
+                path = raw.replace("\\", "/")
+                while path.startswith("./"):
+                    path = path[2:]
+                safe = workspace._safe_rel(path)
+                if safe is None:
+                    conflict(raw or "?", "非法路径")
+                    continue
+                path = safe
+                if path in seen:
+                    conflict(path, "同一交付里重复出现")
+                    continue
+                seen.add(path)
+                deleted = ch.get("deleted") is True
+                sha = ch.get("sha")
+                mode = ch.get("mode") if isinstance(ch.get("mode"), int) else None
+                cur = self._tree_sha(tree, path)
+                old = base.get(path)
+                prev_mode = self._tree_mode(tree, path)
+                if ignore is not None and path != ".gitignore" and ignore.ignores(path):
+                    conflict(path, "路径被项目 .gitignore 忽略", theirs=sha, old=old,
+                             cur=cur, deleted=deleted, mode=mode)
+                    continue
+                if not workspace.match_any(path, t["write"]):
+                    conflict(path, "越界修改：不在任务范围内 %s" % ", ".join(t["write"]),
+                             theirs=sha, old=old, cur=cur, out_of_scope=True,
+                             deleted=deleted, mode=mode)
+                    continue
+                if deleted:
+                    if cur is None:
+                        continue
+                    if old is None:
+                        conflict(path, "文件不在任务快照中，拒绝删除",
+                                 old=None, cur=cur, deleted=True)
+                        continue
+                    if cur != old:
+                        conflict(path, "删除时文件已被别的任务改过",
+                                 old=old, cur=cur, deleted=True)
+                        continue
+                    err = workspace.apply_change(tree, {"path": path, "deleted": True}, self.blobs)
+                    if err:
+                        conflict(path, "删除失败：%s" % err)
+                    else:
+                        record({"path": path, "sha": None, "prev": cur,
+                                "deleted": True, "prev_mode": prev_mode})
+                    continue
+                if not is_sha(sha) or not self.blobs.has(sha):
+                    conflict(path, "blob 缺失，改动作废")
+                    continue
+                if cur == sha:
                     continue
                 if old is None:
-                    conflicts.append({"path": path, "reason": "文件不在任务快照中，拒绝删除",
-                                      "theirs": None, "base": None, "current": cur})
+                    if cur is not None:
+                        conflict(path, "文件在任务派发后出现（不在任务快照中）",
+                                 theirs=sha, old=None, cur=cur, mode=mode)
+                        continue
+                elif cur != old:
+                    if self.auto_merge:
+                        merged_sha = self._try_auto_merge(tree, path, old, cur, sha)
+                        if merged_sha:
+                            record({"path": path, "sha": merged_sha, "prev": cur,
+                                    "deleted": False, "auto_merged": True,
+                                    "prev_mode": prev_mode})
+                            continue
+                    conflict(path, "同一文件被并行改动", theirs=sha, old=old, cur=cur,
+                             auto_merge_failed=bool(self.auto_merge), mode=mode)
                     continue
-                if cur != old:
-                    conflicts.append({"path": path, "reason": "删除时文件已被别的任务改过",
-                                      "theirs": None, "base": old, "current": cur})
-                    continue
-                err = workspace.apply_change(tree, {"path": path, "deleted": True}, self.blobs)
+                err = workspace.apply_change(
+                    tree, {"path": path, "sha": sha, "deleted": False, "mode": mode},
+                    self.blobs)
                 if err:
-                    conflicts.append({"path": path, "reason": "删除失败：%s" % err})
-                else:
-                    applied.append({"path": path, "sha": None, "prev": cur, "deleted": True})
-                continue
-            sha = ch.get("sha")
-            if not is_sha(sha) or not self.blobs.has(sha):
-                conflicts.append({"path": path, "reason": "blob 缺失，改动作废"})
-                continue
-            if cur == sha:
-                continue
-            if old is None:
-                if cur is not None:
-                    conflicts.append({"path": path, "reason": "文件在任务派发后出现（不在任务快照中）",
-                                      "theirs": sha, "base": None, "current": cur})
+                    conflict(path, "写入失败：%s" % err)
                     continue
-            elif cur != old:
-                conflicts.append({"path": path, "reason": "同一文件被并行改动",
-                                  "theirs": sha, "base": old, "current": cur})
-                continue
-            err = workspace.apply_change(tree, {"path": path, "sha": sha, "deleted": False}, self.blobs)
-            if err:
-                conflicts.append({"path": path, "reason": "写入失败：%s" % err})
-                continue
-            applied.append({"path": path, "sha": sha, "prev": old, "deleted": False})
+                record({"path": path, "sha": sha, "prev": old, "deleted": False,
+                        "prev_mode": prev_mode})
+            except Exception as exc:
+                conflict(str(ch.get("path") or "?") if isinstance(ch, dict) else "?",
+                         "处理这条改动时出错：%s" % exc)
         for a in applied:
             t["log"].append(("删除 " if a.get("deleted") else "合并 ") + a["path"])
+            if a.get("auto_merged"):
+                t["log"].append("⇄ 自动三方合并 " + a["path"])
         return applied, conflicts
 
     def _diff_stats(self, p, t, applied):
@@ -1229,11 +1519,11 @@ class Hub(object):
         for a in applied:
             if a.get("deleted"):
                 continue
+            if self.blobs.size(a.get("sha")) > 300000:
+                continue
             try:
                 new = self.blobs.get(a.get("sha"))
             except OSError:
-                continue
-            if len(new) > 300000:
                 continue
             try:
                 text = new.decode("utf-8")
@@ -1266,13 +1556,20 @@ class Hub(object):
                     raise SwarmError("这个路径没有冲突")
                 if item.get("out_of_scope") and choice == "theirs":
                     raise SwarmError("越界内容不能写入主工程")
-                if choice == "theirs" and not self.blobs.has(item.get("theirs")):
+                deleting = bool(item.get("deleted")) and not item.get("theirs")
+                if choice == "theirs" and not deleting and not self.blobs.has(item.get("theirs")):
                     raise SwarmError("节点版本已不存在，无法采用")
                 prev = workspace.tree_sha(p["tree"], path)
+                prev_mode = self._tree_mode(p["tree"], path)
 
             if choice == "theirs":
-                err = workspace.apply_change(
-                    p["tree"], {"path": path, "sha": item["theirs"], "deleted": False}, self.blobs)
+                if deleting:
+                    err = workspace.apply_change(
+                        p["tree"], {"path": path, "deleted": True}, self.blobs)
+                else:
+                    err = workspace.apply_change(
+                        p["tree"], {"path": path, "sha": item["theirs"], "deleted": False,
+                                    "mode": item.get("mode")}, self.blobs)
                 if err:
                     raise SwarmError("写入失败：%s" % err)
 
@@ -1283,13 +1580,18 @@ class Hub(object):
                     raise SwarmError("项目/任务不见了")
                 t2["conflicts"] = [c for c in t2.get("conflicts") or [] if c.get("path") != path]
                 if choice == "theirs":
-                    t2["applied_record"].append({"path": path, "sha": item["theirs"],
-                                                 "prev": prev, "deleted": False})
+                    t2["applied_record"].append({
+                        "path": path, "sha": None if deleting else item["theirs"],
+                        "prev": prev, "deleted": bool(deleting),
+                        "prev_mode": prev_mode})
                 else:
                     t2.setdefault("discarded", []).append({
                         "path": path, "sha": item.get("theirs"), "time": time.time()})
-                t2["log"].append("裁决 %s：%s" % (
-                    path, "采用节点版本" if choice == "theirs" else "保留主工程版本"))
+                if choice == "theirs":
+                    verdict = "采用节点版本（删除文件）" if deleting else "采用节点版本"
+                else:
+                    verdict = "保留主工程版本"
+                t2["log"].append("裁决 %s：%s" % (path, verdict))
                 if not t2["conflicts"] and t2["status"] == "conflict":
                     t2["status"] = "done"
                     t2["ended"] = time.time()
@@ -1322,6 +1624,12 @@ class Hub(object):
             else:
                 old_sha = (t.get("base") or {}).get(safe)
                 new_sha = current_sha
+        if item and item.get("deleted") and not item.get("theirs"):
+            return {"path": safe, "binary": False,
+                    "diff": "节点删除了这个文件。\n主工程内容保留在 %s；"
+                            "选择‘用节点的版本’即接受删除，选择‘保留主工程’即忽略删除。"
+                            % (current_sha or "-"),
+                    "current": current_sha, "theirs": None, "deleted": True}
         old_text = self._blob_text(old_sha)
         new_text = self._blob_text(new_sha)
         if old_text is not None and new_text is not None and \
@@ -1344,6 +1652,8 @@ class Hub(object):
             return ""
         if not self.blobs.has(sha):
             return ""
+        if self.blobs.size(sha) > (2 << 20):
+            return None
         try:
             data = self.blobs.get(sha)
         except OSError:
@@ -1368,12 +1678,28 @@ class Hub(object):
                     if not t:
                         raise SwarmError("没有这个任务")
                 else:
-                    rec = next((m for m in reversed(self.merges) if m["project"] == pid), None)
+                    rec = None
+                    for m in reversed(self.merges):
+                        if m.get("project") != pid:
+                            continue
+                        cand = p["tasks"].get(m.get("task"))
+                        if cand and cand.get("applied_record"):
+                            rec = m
+                            t = cand
+                            break
                     if not rec:
                         raise SwarmError("这个项目还没有可回滚的合并")
-                    t = p["tasks"].get(rec["task"])
                 if not t:
                     raise SwarmError("找不到回滚目标")
+                if t["status"] in ("running", "preparing") and not force:
+                    raise SwarmError(
+                        "任务 %s 正在跑，不能回滚；先暂停/取消，或者加 --force" % t["id"])
+                if force:
+                    nid = t.get("node")
+                    if nid and nid in self.nodes:
+                        self.nodes[nid]["running"] = [
+                            r for r in self.nodes[nid].get("running") or []
+                            if not (r.get("project") == pid and r.get("task") == t["id"])]
                 records = list(t.get("applied_record") or [])
                 if not records:
                     raise SwarmError("任务 %s 没有可回滚的合并记录" % t["id"])
@@ -1388,10 +1714,13 @@ class Hub(object):
                         ", ".join(blocked[:6]))
             restored = []
             for r in reversed(records):
-                path = r["path"]
+                path = workspace._safe_rel(r.get("path"))
+                if path is None:
+                    continue
                 if r.get("prev"):
                     err = workspace.apply_change(
-                        p["tree"], {"path": path, "sha": r["prev"], "deleted": False}, self.blobs)
+                        p["tree"], {"path": path, "sha": r["prev"], "deleted": False,
+                                    "mode": r.get("prev_mode")}, self.blobs)
                     if err:
                         raise SwarmError("恢复 %s 失败：%s" % (path, err))
                 else:
@@ -1414,6 +1743,9 @@ class Hub(object):
                 t2["attempts"] = 0
                 t2["fails"] = 0
                 t2["ended"] = 0
+                t2["committing"] = False
+                t2["feedback"] = None
+                t2["verify"] = None
                 t2["log"].append("↩ 回滚了 %d 个文件，任务重新排队" % len(restored))
                 if p2["status"] not in ("paused", "cancelled"):
                     p2["status"] = "running"
@@ -1487,6 +1819,10 @@ class Hub(object):
                         if not chunk:
                             break
                         out.write(chunk)
+                try:
+                    os.chmod(target, (member.mode or 0o644) & 0o777)
+                except OSError:
+                    pass
         finally:
             tar.close()
 
@@ -1532,6 +1868,101 @@ class Hub(object):
         self.log("垃圾回收：删除 %d 个 blob，释放 %.1f MB" % (removed, freed / 1048576.0))
         return {"removed": removed, "freed": freed, "referenced": len(refs),
                 "remaining": self.blobs.total_bytes()}
+
+    # ------------------------------------------------------------------
+    # 删除 / 导出 / 备份
+    # ------------------------------------------------------------------
+    def delete_project(self, pid):
+        with self.merge_lock:
+            with self.cond:
+                p = self.projects.get(pid)
+                if not p:
+                    raise SwarmError("没有这个项目：%s" % pid)
+                for n in self.nodes.values():
+                    n["running"] = [r for r in n.get("running") or []
+                                    if r.get("project") != pid]
+                for t in p["tasks"].values():
+                    t["status"] = "cancelled"
+                    t["node"] = None
+                    t["lease"] = 0
+                    t["committing"] = False
+                self.projects.pop(pid, None)
+                self._snap_index.pop(pid, None)
+                self._ignore_cache.pop(pid, None)
+                self.merges = deque(
+                    [m for m in self.merges if m.get("project") != pid],
+                    maxlen=MERGE_KEEP)
+                self._touch()
+                self.cond.notify_all()
+            shutil.rmtree(os.path.join(self.root, "projects", pid), ignore_errors=True)
+        self.log("删除项目 %s" % pid, "warn")
+        return {"ok": True, "project": pid}
+
+    def export_archive(self, pid, dest):
+        with self.cond:
+            p = self.projects.get(pid)
+            if not p:
+                raise SwarmError("没有这个项目：%s" % pid)
+            tree = p["tree"]
+        if not os.path.isdir(tree):
+            raise SwarmError("项目目录不存在：%s" % tree)
+        count = 0
+        with tarfile.open(dest, "w:gz") as tar:
+            for rel, full in workspace.iter_tree(tree):
+                tar.add(full, arcname=rel, recursive=False)
+                count += 1
+        return {"files": count, "size": os.path.getsize(dest)}
+
+    def backup_archive(self, dest, include_blobs=True):
+        """给主备/迁移用：state + 令牌 + 项目树（+ blob）。
+
+        整个备份过程持有 merge_lock：备份期间不会有新合并写进树里，
+        恢复出来的 state 和文件内容才是对得上的（代价是备份时合并会短暂排队）。
+        """
+        with self.merge_lock:
+            try:
+                self._save_state()
+            except Exception:
+                pass
+            count = 0
+            with self.cond:
+                pids = list(self.projects)
+            with tarfile.open(dest, "w:gz") as tar:
+                for name in ("state.json", "state.json.bak", "token", "tokens.json"):
+                    full = os.path.join(self.root, name)
+                    if os.path.isfile(full):
+                        tar.add(full, arcname=name, recursive=False)
+                        count += 1
+                for name in ("tls", "projects"):
+                    full = os.path.join(self.root, name)
+                    if os.path.isdir(full):
+                        for dirpath, dirnames, filenames in os.walk(full):
+                            dirnames[:] = [d for d in dirnames
+                                           if d not in ("__pycache__",)
+                                           and not d.startswith(".tmp-")]
+                            for fn in filenames:
+                                if fn.startswith(".tmp-"):
+                                    continue
+                                path = os.path.join(dirpath, fn)
+                                tar.add(path, arcname=os.path.relpath(path, self.root),
+                                        recursive=False)
+                                count += 1
+                if include_blobs and os.path.isdir(self.blobs.root):
+                    for dirpath, dirnames, filenames in os.walk(self.blobs.root):
+                        dirnames[:] = [d for d in dirnames if not d.startswith(".tmp-")]
+                        for fn in filenames:
+                            if fn.startswith(".tmp-"):
+                                continue
+                            path = os.path.join(dirpath, fn)
+                            tar.add(path, arcname=os.path.relpath(path, self.root),
+                                    recursive=False)
+                            count += 1
+            try:
+                os.chmod(dest, 0o600)     # 备份里有令牌
+            except OSError:
+                pass
+        self.log("备份完成：%d 个文件，%.1f MB" % (count, os.path.getsize(dest) / 1048576.0))
+        return {"files": count, "size": os.path.getsize(dest), "projects": len(pids)}
 
     # ------------------------------------------------------------------
     # git 快照（可选，用于额外一层历史）
@@ -1580,7 +2011,8 @@ class Hub(object):
                     for p in self.projects.values():
                         for t in p["tasks"].values():
                             if t.get("node") == nid and t["status"] in ("preparing", "running"):
-                                if t.get("committing") and now - t.get("committing_since", now) < 600:
+                                if t.get("committing") and \
+                                        now - t.get("committing_since", now) < max(600, self.lease * 4):
                                     continue
                                 t["status"] = "queued"
                                 t["node"] = None
@@ -1593,7 +2025,7 @@ class Hub(object):
                         if t["status"] not in ("preparing", "running"):
                             continue
                         if t.get("committing"):
-                            if now - t.get("committing_since", now) < 600:
+                            if now - t.get("committing_since", now) < max(600, self.lease * 4):
                                 continue
                             t["committing"] = False
                         lease = t.get("lease") or 0
@@ -1617,15 +2049,108 @@ class Hub(object):
                     self._save_state()
                 except Exception as exc:
                     self.log("保存状态失败：%s" % exc, "warn")
+            # 快照索引：最多每 30 秒落盘一次，重启后不用重新哈希大仓库
+            if self._snap_dirty:
+                now = time.time()
+                for pid in list(self._snap_dirty):
+                    if now - self._snap_saved.get(pid, 0) >= 30:
+                        try:
+                            self._save_snap_index(pid)
+                        except Exception:
+                            self._snap_dirty.discard(pid)
+
+    # ------------------------------------------------------------------
+    # TLS（可选）
+    # ------------------------------------------------------------------
+    def _tls_paths(self):
+        base = os.path.join(self.root, "tls")
+        return (self.tls_cert or os.path.join(base, "cert.pem"),
+                self.tls_key or os.path.join(base, "key.pem"))
+
+    @staticmethod
+    def cert_fingerprint(cert_path):
+        with open(cert_path, "r", encoding="utf-8") as f:
+            pem = f.read()
+        try:
+            der = ssl.PEM_cert_to_DER_cert(pem)
+        except ValueError:
+            raise SwarmError("证书不是 PEM 格式：%s" % cert_path)
+        return sha256_bytes(der)
+
+    def ensure_tls(self):
+        """准备证书。没给证书就用 openssl 在 ~/.swarm/tls 生成一张自签的。"""
+        if not self.tls:
+            return None
+        cert, key = self._tls_paths()
+        if not (os.path.exists(cert) and os.path.exists(key)):
+            if self.tls_cert or self.tls_key:
+                raise SwarmError("指定的证书/私钥不存在：%s / %s" % (cert, key))
+            self._generate_cert(cert, key)
+        self.tls_cert, self.tls_key = cert, key
+        self.tls_fingerprint = self.cert_fingerprint(cert)
+        try:
+            os.chmod(key, 0o600)
+        except OSError:
+            pass
+        return cert, key, self.tls_fingerprint
+
+    def _generate_cert(self, cert, key):
+        openssl = shutil.which("openssl")
+        if not openssl:
+            raise SwarmError(
+                "没有 openssl，无法自动生成自签证书。两种办法：\n"
+                "  1) 安装 openssl（Termux: pkg install openssl）后重试 --tls；\n"
+                "  2) 自己生成证书，然后用 --tls --tls-cert cert.pem --tls-key key.pem")
+        base_dir = os.path.dirname(cert) or "."
+        os.makedirs(base_dir, exist_ok=True)
+        try:
+            os.chmod(base_dir, 0o700)
+        except OSError:
+            pass
+        names = ["IP:127.0.0.1", "DNS:localhost"]
+        lan = proto.lan_ip()
+        if lan and lan != "127.0.0.1":
+            names.append("IP:" + lan)
+        try:
+            host = socket.gethostname()
+            if host and host not in ("localhost",):
+                names.append("DNS:" + host)
+        except Exception:
+            pass
+        extra = os.environ.get("SWARM_TLS_SAN") or ""
+        names.extend(n.strip() for n in extra.split(",") if n.strip())
+        san = ",".join(dict.fromkeys(names))
+        base = [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", key, "-out", cert, "-days", "3650",
+                "-subj", "/CN=swarm-hub"]
+        attempts = [base + ["-addext", "subjectAltName=" + san], base]
+        last = None
+        for args in attempts:
+            try:
+                res = subprocess.run(args, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, timeout=60)
+            except Exception as exc:
+                last = exc
+                continue
+            if res.returncode == 0 and os.path.exists(cert) and os.path.exists(key):
+                self.log("已生成自签 TLS 证书：%s（指纹 %s…）" %
+                         (cert, self.cert_fingerprint(cert)[:16]))
+                return
+            last = res.stderr.decode("utf-8", "replace")[:300]
+        raise SwarmError("生成证书失败：%s" % last)
 
     def start_background(self):
         self.stop.clear()
+        if self.tls:
+            self.ensure_tls()
         t1 = threading.Thread(target=self._janitor, name="swarm-janitor", daemon=True)
         t1.start()
+        info = {"name": self.name, "port": self.port, "addr": proto.lan_ip()}
+        if self.tls and self.tls_fingerprint:
+            info["tls"] = self.tls_fingerprint
         t2 = threading.Thread(
             target=discover.serve_responder,
-            args=(self.discovery_port, {"name": self.name, "port": self.port, "addr": proto.lan_ip()},
-                  self.stop, self.log),
+            args=(self.discovery_port, info, self.stop, self.log),
             name="swarm-discover", daemon=True)
         t2.start()
         self._threads = [t1, t2]
@@ -1635,32 +2160,86 @@ class Hub(object):
 
     def make_server(self):
         hub = self
+        if self.tls:
+            self.ensure_tls()
 
         class Handler(ApiHandler):
             pass
 
+        class Server(ThreadingHTTPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+            request_queue_size = 64
+            max_connections = 64
+
+            def __init__(self, *args, **kwargs):
+                ThreadingHTTPServer.__init__(self, *args, **kwargs)
+                self._conn_slots = threading.BoundedSemaphore(self.max_connections)
+
+            def process_request(self, request, client_address):
+                if not self._conn_slots.acquire(blocking=False):
+                    # 连接数打满：直接关掉，防止无上限建线程
+                    try:
+                        request.close()
+                    except OSError:
+                        pass
+                    return
+                try:
+                    ThreadingHTTPServer.process_request(self, request, client_address)
+                except Exception:
+                    self._conn_slots.release()
+                    raise
+
+            def process_request_thread(self, request, client_address):
+                try:
+                    ThreadingHTTPServer.process_request_thread(self, request, client_address)
+                finally:
+                    try:
+                        self._conn_slots.release()
+                    except ValueError:
+                        pass
+
+            def handle_error(self, request, client_address):
+                exc = sys.exc_info()[1]
+                if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+                    return
+                ThreadingHTTPServer.handle_error(self, request, client_address)
+
         Handler.hub = hub
-        ThreadingHTTPServer.allow_reuse_address = True
-        ThreadingHTTPServer.daemon_threads = True
-        srv = ThreadingHTTPServer((self.bind, self.port), Handler)
+        srv = Server((self.bind, self.port), Handler)
+        if self.tls:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            try:
+                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            except (AttributeError, ValueError):
+                pass
+            ctx.load_cert_chain(self.tls_cert, self.tls_key)
+            srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+            # 握手放到工作线程里做，慢客户端不会卡住 accept 循环
+            srv.socket.do_handshake_on_connect = False
         self._server = srv
         return srv
 
     def serve_forever(self):
         srv = self.make_server()
         self.start_background()
+        scheme = "https" if self.tls else "http"
         prints = [
             "",
             "  ╭──────────────────────────────────────────────╮",
             "  │  Swarm 调度中心已启动                        │",
             "  ╰──────────────────────────────────────────────╯",
-            "  看板   http://%s:%d/   （手机浏览器直接开）" % (proto.lan_ip(), self.port),
+            "  看板   %s://%s:%d/   （手机浏览器直接开）" % (scheme, proto.lan_ip(), self.port),
             "  地址   %s:%d" % (proto.lan_ip(), self.port),
             "  主令牌 %s" % self.token,
-            "  节点令牌   ./bin/swarm tokens add <名字> --hub 127.0.0.1:%d" % self.port,
+            "  节点令牌   ./bin/swarm tokens add <名字> --hub %s://127.0.0.1:%d"
+            % (scheme, self.port),
             "  自动发现 UDP %d（节点用 --discover 即可，不用填 IP）" % self.discovery_port,
-            "",
         ]
+        if self.tls:
+            prints.append("  TLS    已启用，证书指纹 %s" % self.tls_fingerprint)
+            prints.append("         节点用 --discover 会自动带上指纹；手动连接加 --tls 并核对指纹")
+        prints.append("")
         sys.stdout.write("\n".join(prints) + "\n")
         sys.stdout.flush()
         try:
@@ -1681,6 +2260,11 @@ class Hub(object):
                 self._save_state()
             except Exception:
                 pass
+            for pid in list(self._snap_dirty):
+                try:
+                    self._save_snap_index(pid)
+                except Exception:
+                    pass
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()
@@ -1710,15 +2294,21 @@ class Hub(object):
                 for tid in p["order"]:
                     t = p["tasks"][tid]
                     counts[t["status"]] = counts.get(t["status"], 0) + 1
+                    verify = t.get("verify")
+                    if isinstance(verify, dict):
+                        # 状态轮询不传大段验收输出（完整内容走 /api/tasklog）
+                        verify = {"ok": bool(verify.get("ok")),
+                                  "cmd": str(verify.get("cmd") or "")[:300]}
                     tasks.append({
                         "id": t["id"], "title": t["title"], "status": t["status"],
                         "node": t.get("node"), "deps": list(t["deps"]), "write": list(t["write"]),
                         "attempts": t["attempts"], "fails": int(t.get("fails") or 0),
                         "conflicts": list(t.get("conflicts") or []),
                         "stats": dict(t.get("stats") or {}), "started": t.get("started"),
-                        "ended": t.get("ended"), "log_tail": (t.get("log") or [])[-6:],
-                        "verify": t.get("verify"), "blocked_by": t.get("blocked_by"),
+                        "ended": t.get("ended"), "log_tail": (t.get("log") or [])[-4:],
+                        "verify": verify, "blocked_by": t.get("blocked_by"),
                         "applied": len(t.get("applied_record") or []),
+                        "feedback": (t.get("feedback") or "")[:300],
                     })
                 projects.append({
                     "id": p["id"], "title": p["title"], "status": p["status"],
@@ -1730,7 +2320,10 @@ class Hub(object):
             events = list(self.events)[-80:]
         return {
             "hub": {"name": self.name, "proto": PROTO, "version": __version__,
-                    "uptime": round(now - self.started_at, 1)},
+                    "uptime": round(now - self.started_at, 1),
+                    "tls": bool(self.tls),
+                    "tls_fingerprint": self.tls_fingerprint,
+                    "auto_merge": bool(self.auto_merge)},
             "nodes": nodes,
             "projects": projects,
             "stats": stats,
@@ -1747,10 +2340,12 @@ class ApiHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "SwarmHub/" + __version__
     disable_nagle_algorithm = True
+    timeout = 60          # 慢客户端 / 半开连接不会永久占线程
 
     ADMIN_PATHS = {"/api/state", "/api/submit", "/api/control", "/api/resolve",
                    "/api/tasklog", "/api/diff", "/api/rollback", "/api/tokens",
-                   "/api/import", "/api/gc"}
+                   "/api/import", "/api/gc", "/api/delete", "/api/export",
+                   "/api/backup"}
     NODE_PATHS = {"/api/heartbeat", "/api/claim", "/api/progress",
                   "/api/complete", "/api/fail"}
 
@@ -1766,11 +2361,34 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
         for k, v in (headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
         try:
             self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+
+    def _send_file(self, path, filename, ctype="application/gzip"):
+        """把临时文件分块发出去，避免把大项目整个读进内存。"""
+        size = os.path.getsize(path)
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition",
+                         'attachment; filename="%s"' % filename.replace('"', ""))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
 
@@ -1794,11 +2412,13 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _session_cookie(self):
         val = self.hub.new_session()
-        return ("swarm_session=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Lax"
-                % (val, self.hub.session_ttl))
+        secure = "; Secure" if self.hub.tls else ""
+        return ("swarm_session=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Lax%s"
+                % (val, self.hub.session_ttl, secure))
 
     def _clear_cookie(self):
-        return "swarm_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+        secure = "; Secure" if self.hub.tls else ""
+        return "swarm_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax" + secure
 
     def _auth(self, body):
         ts = self.headers.get("X-Swarm-Ts") or ""
@@ -1854,14 +2474,44 @@ class ApiHandler(BaseHTTPRequestHandler):
         if header and header != nid:
             raise ForbiddenError("请求头 node 与载荷不一致")
 
-    def _body(self):
+    def _body(self, limit=None):
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except (TypeError, ValueError):
             raise SwarmError("Content-Length 非法")
-        if length < 0 or length > proto.BODY_LIMIT:
+        cap = proto.BODY_LIMIT if limit is None else min(int(limit), proto.BODY_LIMIT)
+        if length < 0 or length > cap:
             raise SwarmError("请求体过大")
-        return self.rfile.read(length) if length else b""
+        if not length:
+            return b""
+        big = length > (8 << 20)
+        if big and not self.hub.body_slots.acquire(timeout=30):
+            raise SwarmError("服务器正忙（同时上传的大请求太多），稍后重试")
+        try:
+            return self.rfile.read(length)
+        finally:
+            if big:
+                try:
+                    self.hub.body_slots.release()
+                except ValueError:
+                    pass
+
+    def _preauth_ok(self, path):
+        """读 body 之前先做零成本的检查：要么有看板会话，要么带看起来合理的签名头。
+
+        真正的签名校验仍要等 body 读完；这里只防止完全匿名的大 body 打进来。
+        """
+        if (path in self.ADMIN_PATHS or path == "/api/logout") and self._dashboard_ok():
+            return True
+        ts = self.headers.get("X-Swarm-Ts") or ""
+        sig = self.headers.get("X-Swarm-Sig") or ""
+        if not ts or not sig:
+            return False
+        try:
+            ts_i = int(ts)
+        except (TypeError, ValueError):
+            return False
+        return abs(time.time() - ts_i) <= (proto.MAX_SKEW + 5)
 
     # -- 路由 -----------------------------------------------------------
     def do_HEAD(self):
@@ -1880,7 +2530,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             body = b""
             if method == "POST":
-                body = self._body()
+                if not self._preauth_ok(path):
+                    return self._err(401, "缺少签名，或时间戳偏差过大（检查两台机器的时钟）")
+                # 按接口收紧请求体上限：普通 API 8MB，blob 单文件上限，import 才放到 64MB
+                if path == "/api/import":
+                    limit = proto.BODY_LIMIT
+                elif path.startswith("/api/blob/"):
+                    limit = workspace.MAX_FILE + (1 << 20)
+                else:
+                    limit = 8 << 20
+                body = self._body(limit)
 
             if path in ("/", "/index.html"):
                 supplied = (query.get("t") or [""])[0]
@@ -1894,7 +2553,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return None
-                return self._send(200, DASHBOARD_HTML, "text/html; charset=utf-8")
+                return self._send(200, DASHBOARD_HTML, "text/html; charset=utf-8",
+                                  headers={"Content-Security-Policy":
+                                           "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                                           "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                                           "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"})
             if path == "/favicon.ico":
                 return self._send(204, b"")
             if path == "/healthz":
@@ -1999,6 +2662,26 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._json(200, self.hub.rollback(payload))
             if path == "/api/gc" and method == "POST":
                 return self._json(200, self.hub.gc(grace=payload.get("grace", 600)))
+            if path == "/api/delete" and method == "POST":
+                return self._json(200, self.hub.delete_project(str(payload.get("project") or "")))
+            if path == "/api/export" and method == "GET":
+                pid = (query.get("project") or [""])[0]
+                tmpdir = tempfile.mkdtemp(prefix="swarm-export-", dir=self.hub.root)
+                dest = os.path.join(tmpdir, "export.tar.gz")
+                try:
+                    self.hub.export_archive(pid, dest)
+                    return self._send_file(dest, "%s.tar.gz" % pid)
+                finally:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+            if path == "/api/backup" and method == "GET":
+                include = (query.get("blobs") or ["1"])[0] not in ("0", "false", "no")
+                tmpdir = tempfile.mkdtemp(prefix="swarm-backup-", dir=self.hub.root)
+                dest = os.path.join(tmpdir, "backup.tar.gz")
+                try:
+                    self.hub.backup_archive(dest, include_blobs=include)
+                    return self._send_file(dest, "swarm-backup.tar.gz")
+                finally:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
             if path == "/api/tokens" and method == "GET":
                 return self._json(200, {"tokens": self.hub.token_view()})
             if path == "/api/tokens" and method == "POST":
@@ -2024,6 +2707,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                             "conflicts": list(t.get("conflicts") or []),
                             "applied": list(t.get("applied_record") or []),
                             "verify": t.get("verify"),
+                            "feedback": t.get("feedback"),
                             "log": list(t.get("log") or [])}
                 return self._json(200, data)
             return self._err(404, "没有这个接口：%s" % path)
@@ -2060,6 +2744,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if t["status"] == "blocked" and t.get("blocked_by"):
                     raise SwarmError("任务 %s 被上游 %s 阻塞，请先重试上游任务" %
                                      (tid, t["blocked_by"]))
+                if t["status"] in ("running", "preparing"):
+                    raise SwarmError("任务 %s 正在某个节点上跑，先暂停/取消再重试" % tid)
+                if t["status"] == "done":
+                    raise SwarmError("任务 %s 已完成；要重做请先 rollback 再重试" % tid)
+                nid = t.get("node")
+                if nid and nid in hub.nodes:
+                    hub.nodes[nid]["running"] = [
+                        r for r in hub.nodes[nid].get("running") or []
+                        if not (r.get("project") == pid and r.get("task") == tid)]
                 t["status"] = "queued"
                 t["attempts"] = 0
                 t["fails"] = 0
@@ -2067,25 +2760,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                 t["lease"] = 0
                 t["ended"] = 0
                 t["blocked_by"] = None
+                t["committing"] = False
+                t["feedback"] = None
+                t["conflicts"] = []
+                t["base"] = {}
                 t["log"] = list(t.get("log") or [])[-50:]
                 t["log"].append("↻ 人工重试")
                 p["status"] = "running"
                 hub._finalize_locked(p)
             elif action == "cancel":
                 p["status"] = "cancelled"
-                for t in p["tasks"].values():
-                    if t["status"] in ("queued", "running", "preparing", "blocked"):
-                        t["status"] = "cancelled"
-                        t["node"] = None
-                        t["lease"] = 0
-                        t["base"] = {}
+                hub._cancel_tasks_locked(p)
             elif action == "finish":
-                for t in p["tasks"].values():
-                    if t["status"] in ("queued", "running", "preparing", "blocked"):
-                        t["status"] = "cancelled"
-                        t["node"] = None
-                        t["lease"] = 0
-                        t["base"] = {}
+                hub._cancel_tasks_locked(p)
                 p["status"] = "done"
             else:
                 raise SwarmError("未知动作：%s" % action)
@@ -2119,31 +2806,44 @@ class ApiHandler(BaseHTTPRequestHandler):
         if method == "GET":
             if not store.has(sha):
                 return self._err(404, "没有这个 blob")
-            data = store.get(sha)
+            size = store.size(sha)
             headers = {}
+            data = None
             accepted = self.headers.get("X-Swarm-Accept") or ""
-            if "gzip" in accepted:
-                packed, did = proto.compress(data)
+            # 小文件才在内存里压；大文件直接流式发，避免 hub 吃掉整块内存
+            if "gzip" in accepted and 0 <= size <= (2 << 20):
+                packed, did = proto.compress(store.get(sha))
                 if did:
                     data = packed
                     headers["X-Swarm-Encoding"] = "gzip"
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Length", str(len(data) if data is not None else size))
             for k, v in headers.items():
                 self.send_header(k, v)
             self.end_headers()
+            sent = 0
             try:
-                self.wfile.write(data)
+                if data is not None:
+                    self.wfile.write(data)
+                    sent = len(data)
+                else:
+                    with store.open(sha) as f:
+                        while True:
+                            chunk = f.read(1 << 20)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            sent += len(chunk)
             except (BrokenPipeError, ConnectionResetError):
                 self.close_connection = True
-            self.hub._add_blob_bytes("blob_out", len(data))
+            self.hub._add_blob_bytes("blob_out", sent)
             return None
         if method == "POST":
             if (self.headers.get("X-Swarm-Encoding") or "").lower() == "gzip":
                 body = proto.decompress_limited(body)
-            if len(body) > 16 << 20:
-                return self._err(400, "单个文件超过 16MB 上限")
+            if len(body) > workspace.MAX_FILE:
+                return self._err(400, "单个文件超过 %dMB 上限" % (workspace.MAX_FILE >> 20))
             if not body or sha256_bytes(body) != sha:
                 return self._err(400, "内容与 sha 不符")
             store.put_bytes(body)

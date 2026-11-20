@@ -15,6 +15,7 @@ import base64
 import io
 import json
 import os
+import shutil
 import sys
 import tarfile
 import time
@@ -35,7 +36,13 @@ def _client(args, need_token=True):
     token = getattr(args, "token", None) or os.environ.get("SWARM_TOKEN")
     if not hub:
         raise SwarmError("没指定 hub：用 --hub <ip:port> 或设 SWARM_HUB")
-    host, port = proto.parse_hub_addr(hub, DEFAULT_PORT)
+    scheme, host, port = proto.split_hub_addr(hub, DEFAULT_PORT)
+    tls = (scheme == "https" or bool(getattr(args, "tls", False))
+           or bool(os.environ.get("SWARM_TLS")))
+    pin = getattr(args, "tls_pin", None) or os.environ.get("SWARM_TLS_PIN")
+    ca = getattr(args, "ca", None) or os.environ.get("SWARM_CA")
+    insecure = bool(getattr(args, "insecure", False)) or bool(
+        os.environ.get("SWARM_TLS_INSECURE"))
     if not token:
         root = getattr(args, "root", None)
         if root:
@@ -45,7 +52,13 @@ def _client(args, need_token=True):
                     token = f.read().strip()
     if need_token and not token:
         raise SwarmError("没指定令牌：用 --token 或设 SWARM_TOKEN（hub 启动时会打印）")
-    return HubClient(host, port, token or "", timeout=30)
+    if tls and not pin and not ca and not insecure:
+        sys.stderr.write(
+            "⚠ 已启用 TLS 但没有 --tls-pin / --ca：只加密、不校验身份。\n"
+            "  从 hub 启动日志抄证书指纹加 --tls-pin，或用 --insecure 显式确认。\n")
+    return HubClient(host, port, token or "", timeout=30,
+                     scheme="https" if tls else "http",
+                     tls_pin=pin, ca=ca, insecure=insecure)
 
 
 def _read_spec(path):
@@ -79,6 +92,8 @@ def cmd_hub(args):
         stale_after=args.stale, max_attempts=args.max_attempts,
         use_git=not args.no_git, verbose=not args.quiet,
         allow_empty=args.allow_empty, session_ttl=args.session_ttl,
+        auto_merge=args.auto_merge, tls=args.tls,
+        tls_cert=args.tls_cert, tls_key=args.tls_key,
     )
     hub.serve_forever()
     return 0
@@ -95,6 +110,8 @@ def cmd_node(args):
         cmd=args.cmd, base_url=args.llm_base, model=args.model, api_key=args.api_key,
         mock_delay=args.mock_delay, discovery_port=args.discovery_port,
         keep_work=args.keep_work, verify=args.verify,
+        tls=args.tls, tls_pin=args.tls_pin, ca=args.ca, insecure=args.insecure,
+        once=args.once,
     )
     return node.run()
 
@@ -151,13 +168,9 @@ def _watch(client, pid):
     return 3
 
 
-def cmd_status(args):
-    client = _client(args)
-    state = client.get_json("/api/state")
-    if args.json:
-        print(json.dumps(state, ensure_ascii=False, indent=2))
-        return 0
-    print("hub: %s  v%s  运行 %.0fs" % (state["hub"]["name"], state["hub"]["version"], state["hub"]["uptime"]))
+def _print_status(state):
+    print("hub: %s  v%s  运行 %.0fs" % (state["hub"]["name"], state["hub"]["version"],
+                                       state["hub"]["uptime"]))
     nodes = state["nodes"]
     if not nodes:
         print("节点：无（在其它 Linux 上运行 ./bin/swarm node --discover）")
@@ -181,7 +194,27 @@ def cmd_status(args):
                 extra += "  验收%s" % ("通过" if t["verify"].get("ok") else "失败")
             print("  %s %-16s %-10s %s%s" % (marks, t["id"], t["status"], t["title"], extra))
     print("\n统计：%s" % json.dumps(state.get("stats") or {}, ensure_ascii=False))
-    return 0
+
+
+def cmd_status(args):
+    client = _client(args)
+    state = client.get_json("/api/state")
+    if args.json:
+        print(json.dumps(state, ensure_ascii=False, indent=2))
+        return 0
+    if not args.watch:
+        _print_status(state)
+        return 0
+    try:
+        while True:
+            # 清屏再画，手机终端上更像一个实时面板
+            sys.stdout.write("\033[2J\033[H")
+            _print_status(client.get_json("/api/state"))
+            sys.stdout.flush()
+            time.sleep(max(1, args.interval))
+    except KeyboardInterrupt:
+        print("\n停止观察（项目仍在后台跑）")
+        return 0
 
 
 def cmd_control(args):
@@ -203,6 +236,14 @@ def cmd_logs(args):
     if res.get("verify"):
         v = res["verify"]
         print("  验收：%s（%s）" % ("通过" if v.get("ok") else "失败", v.get("cmd")))
+        if not v.get("ok") and v.get("out"):
+            print("  验收输出（尾部）：")
+            for line in str(v["out"]).splitlines()[-10:]:
+                print("    " + line)
+    if res.get("feedback"):
+        print("  上次失败反馈（重试时会带给 agent）：")
+        for line in str(res["feedback"]).splitlines()[:10]:
+            print("    " + line)
     print("--- 日志 ---")
     for line in res.get("log") or []:
         print("  " + line)
@@ -366,14 +407,27 @@ def cmd_token(args):
 
 
 def cmd_export(args):
-    root = os.path.abspath(args.root)
-    tree = os.path.join(root, "projects", args.project, "tree")
-    if not os.path.isdir(tree):
-        raise SwarmError("没有这个项目：%s" % args.project)
     out = args.out or ("%s.tar.gz" % args.project)
-    with tarfile.open(out, "w:gz") as tar:
-        for rel, full in workspace.iter_tree(tree):
-            tar.add(full, arcname=rel, recursive=False)
+    if args.hub:
+        client = _client(args)
+        status, data = client.raw_full(
+            "GET", "/api/export?project=%s" % proto.quote(args.project), timeout=900)[:2]
+        if status >= 400:
+            raise SwarmError("导出失败 HTTP %d" % status)
+        with open(out, "wb") as f:
+            f.write(data)
+        try:
+            os.chmod(out, 0o600)     # 备份里有令牌
+        except OSError:
+            pass
+    else:
+        root = os.path.abspath(args.root)
+        tree = os.path.join(root, "projects", args.project, "tree")
+        if not os.path.isdir(tree):
+            raise SwarmError("没有这个项目：%s" % args.project)
+        with tarfile.open(out, "w:gz") as tar:
+            for rel, full in workspace.iter_tree(tree):
+                tar.add(full, arcname=rel, recursive=False)
     print("已导出 %s（%.1f KB）" % (out, os.path.getsize(out) / 1024.0))
     return 0
 
@@ -383,13 +437,192 @@ def cmd_demo(args):
     return run_demo(nodes=args.nodes, keep=args.keep, root=args.root)
 
 
-def _add_conn(sp, root_default=None):
+def _add_conn(sp, root_default=None, tls=True):
     sp.add_argument("--hub", default=None)
     sp.add_argument("--token", default=None)
     if root_default is not None:
         sp.add_argument("--root", default=root_default)
     else:
         sp.add_argument("--root", default=None)
+    if tls:
+        sp.add_argument("--tls", action="store_true", help="用 HTTPS 连接 hub（--hub https:// 亦可）")
+        sp.add_argument("--tls-pin", default=None, help="hub 证书指纹（sha256，hub 启动时打印）")
+        sp.add_argument("--ca", default=None, help="自签 CA 文件（启用主机名校验）")
+        sp.add_argument("--insecure", action="store_true", help="TLS 只加密、不校验身份")
+
+
+# --------------------------------------------------------------------------
+# 备份 / 恢复 / 删除 / 自检
+# --------------------------------------------------------------------------
+
+def cmd_backup(args):
+    out = args.out or ("swarm-backup-%s.tar.gz" % time.strftime("%Y%m%d-%H%M%S"))
+    include_blobs = not args.no_blobs
+    if args.hub:
+        client = _client(args)
+        status, data = client.raw_full(
+            "GET", "/api/backup?blobs=%d" % (1 if include_blobs else 0), timeout=1800)[:2]
+        if status >= 400:
+            raise SwarmError("备份失败 HTTP %d" % status)
+        with open(out, "wb") as f:
+            f.write(data)
+        try:
+            os.chmod(out, 0o600)     # 备份里有令牌
+        except OSError:
+            pass
+    else:
+        if not args.root:
+            raise SwarmError("离线备份需要 --root <hub 数据目录>；或加 --hub 走运行中的 hub")
+        hub = _local_hub(args.root)
+        try:
+            hub.backup_archive(out, include_blobs=include_blobs)
+        finally:
+            hub.shutdown(save=False)
+    print("已备份到 %s（%.1f MB）" % (out, os.path.getsize(out) / 1048576.0))
+    if not include_blobs:
+        print("注意：--no-blobs 只备份状态和当前项目树，历史版本的回滚/冲突裁决会不可用。")
+    print("换机器：./bin/swarm restore %s --root ~/.swarm 然后启动 hub" % out)
+    return 0
+
+
+def _safe_extract(archive, dest):
+    dest = os.path.abspath(dest)
+    os.makedirs(dest, exist_ok=True)
+    count = 0
+    total = 0
+    with tarfile.open(archive, "r:gz") as tar:
+        for member in tar:
+            if not (member.isfile() or member.isdir()):
+                continue
+            name = member.name.replace("\\", "/")
+            while name.startswith("./"):
+                name = name[2:]
+            safe = workspace._safe_rel(name)
+            if safe is None:
+                continue
+            target = os.path.join(dest, safe)
+            if not os.path.abspath(target).startswith(dest + os.sep):
+                continue
+            total += max(0, member.size)
+            if total > (2 << 30):
+                raise SwarmError("备份解压后超过 2GB，拒绝恢复")
+            if member.isdir():
+                os.makedirs(target, exist_ok=True)
+                continue
+            parent = os.path.dirname(target)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            src = tar.extractfile(member)
+            if src is None:
+                continue
+            with open(target, "wb") as out:
+                while True:
+                    chunk = src.read(1 << 20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            try:
+                os.chmod(target, (member.mode or 0o644) & 0o777)
+            except OSError:
+                pass
+            count += 1
+    return count
+
+
+def cmd_restore(args):
+    root = os.path.abspath(args.root)
+    if not os.path.isfile(args.archive):
+        raise SwarmError("备份文件不存在：%s" % args.archive)
+    marker = os.path.join(root, "state.json")
+    if os.path.exists(marker) and not args.force:
+        raise SwarmError(
+            "%s 里已经有 state.json。确认要覆盖就加 --force（先停掉正在跑的 hub）" % root)
+    count = _safe_extract(args.archive, root)
+    print("已恢复到 %s：%d 个文件。" % (root, count))
+    print("确认没有旧 hub 在跑，然后：./bin/swarm hub --root %s" % root)
+    return 0
+
+
+def cmd_delete(args):
+    if args.hub:
+        client = _client(args)
+        res = client.call("POST", "/api/delete", {"project": args.project})
+    else:
+        if not args.root:
+            raise SwarmError("离线删除需要 --root；或加 --hub 走运行中的 hub")
+        hub = _local_hub(args.root)
+        try:
+            res = hub.delete_project(args.project)
+        finally:
+            hub.shutdown()      # 删除要落盘，否则重启后项目又回来了
+    print("已删除项目 %s（blob 等 gc 再清）" % res.get("project", args.project))
+    return 0
+
+
+def cmd_doctor(args):
+    ok = True
+    print("Swarm 自检")
+    print("  Python      %s" % sys.version.split()[0])
+    if sys.version_info < (3, 8):
+        print("  ✘ Python 需要 3.8+")
+        ok = False
+    openssl = shutil.which("openssl")
+    print("  openssl     %s" % ("有（可以用 --tls 自动生成证书）" if openssl else "没有（TLS 需自带证书）"))
+    print("  git         %s" % ("有" if shutil.which("git") else "没有（hub 用 --no-git）"))
+    hub = getattr(args, "hub", None) or os.environ.get("SWARM_HUB")
+    root = getattr(args, "root", None)
+    if not hub and root:
+        path = os.path.join(os.path.abspath(root), "token")
+        if os.path.exists(path):
+            print("  主令牌      %s…（%s）" % (open(path).read().strip()[:8], root))
+            try:
+                state_path = os.path.join(os.path.abspath(root), "state.json")
+                if os.path.exists(state_path):
+                    with open(state_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    print("  离线状态    %d 个项目" % len(data.get("projects") or {}))
+                else:
+                    print("  离线状态    （还没有项目）")
+            except Exception as exc:
+                print("  ✘ 状态文件读不了：%s" % exc)
+                ok = False
+        else:
+            print("  ✘ %s 不像一个 hub 目录（没有 token）" % root)
+            ok = False
+        return 0 if ok else 1
+    if not hub:
+        print("\n提示：加 --hub <ip:port> 或在 hub 机器上加 --root 检查连接")
+        return 0
+    try:
+        client = _client(args, need_token=False)
+        ping = client.ping(timeout=5)
+        skew = time.time() - float(ping.get("server_time") or time.time())
+        print("  hub 连接    %s v%s（协议 v%s）" % (ping.get("hub"), ping.get("version"),
+                                                   ping.get("proto")))
+        print("  时钟偏差    %+.1f 秒%s" % (skew, "  ✘ 超过 180 秒会鉴权失败"
+                                          if abs(skew) > 180 else ""))
+        if abs(skew) > 180:
+            ok = False
+        token = getattr(args, "token", None) or os.environ.get("SWARM_TOKEN")
+        if not token and root:
+            path = os.path.join(os.path.abspath(root), "token")
+            if os.path.exists(path):
+                token = open(path).read().strip()
+                client.token = token
+        if token:
+            try:
+                state = client.get_json("/api/state")
+                print("  权限        主令牌（%d 节点 / %d 项目）" %
+                      (len(state.get("nodes") or []), len(state.get("projects") or [])))
+                print("  TLS         %s" % ("已启用" if (state.get("hub") or {}).get("tls") else "未启用"))
+            except Exception as exc:
+                print("  权限        节点令牌或受限（%s）" % exc)
+        else:
+            print("  权限        未提供令牌（只做了连通性检查）")
+    except Exception as exc:
+        print("  ✘ 连不上 hub：%s" % exc)
+        ok = False
+    return 0 if ok else 1
 
 
 # --------------------------------------------------------------------------
@@ -415,6 +648,11 @@ def build_parser():
     h.add_argument("--allow-empty", action="store_true", help="允许任务交空改动（默认不允许）")
     h.add_argument("--token", default=None, help="手动指定主令牌（默认自动生成保存在 root/token）")
     h.add_argument("--no-git", action="store_true", help="不在项目目录里做 git 提交")
+    h.add_argument("--auto-merge", action="store_true",
+                   help="同一文件两边改不重叠区域时自动三方合并（默认交给人工裁决）")
+    h.add_argument("--tls", action="store_true", help="启用 HTTPS（没证书会自动生成自签证书）")
+    h.add_argument("--tls-cert", default=None, help="证书 PEM（配合 --tls）")
+    h.add_argument("--tls-key", default=None, help="私钥 PEM（配合 --tls）")
     h.add_argument("--quiet", action="store_true")
     h.set_defaults(func=cmd_hub)
 
@@ -436,6 +674,12 @@ def build_parser():
     n.add_argument("--mock-delay", type=float, default=0.4)
     n.add_argument("--discovery-port", type=int, default=DEFAULT_DISCOVERY_PORT)
     n.add_argument("--keep-work", action="store_true", help="保留任务工作目录，便于排查")
+    n.add_argument("--tls", action="store_true", help="用 HTTPS 连接 hub（--discover 会自动启用）")
+    n.add_argument("--tls-pin", default=None, help="hub 证书指纹（默认用自动发现带回来的）")
+    n.add_argument("--ca", default=None, help="自签 CA 文件")
+    n.add_argument("--insecure", action="store_true", help="TLS 只加密、不校验身份")
+    n.add_argument("--once", action="store_true",
+                   help="只领一个任务，干完退出（验证 agent 配置是否可用）")
     n.set_defaults(func=cmd_node)
 
     # submit
@@ -462,6 +706,8 @@ def build_parser():
     st = sub.add_parser("status", help="查看节点和任务进度")
     _add_conn(st)
     st.add_argument("--json", action="store_true")
+    st.add_argument("--watch", action="store_true", help="每 N 秒刷新一次（Ctrl-C 退出）")
+    st.add_argument("--interval", type=int, default=2)
     st.set_defaults(func=cmd_status)
 
     # control
@@ -526,9 +772,31 @@ def build_parser():
     # export
     ex = sub.add_parser("export", help="把合并后的项目打包")
     ex.add_argument("project")
-    ex.add_argument("--root", default=os.path.join(os.path.expanduser("~"), ".swarm"))
+    _add_conn(ex, root_default=os.path.join(os.path.expanduser("~"), ".swarm"))
     ex.add_argument("-o", "--out", default=None)
     ex.set_defaults(func=cmd_export)
+
+    # backup / restore / delete / doctor
+    bk = sub.add_parser("backup", help="备份 hub（状态 + 令牌 + 项目 + blob），用于迁移/主备")
+    _add_conn(bk, root_default=os.path.join(os.path.expanduser("~"), ".swarm"))
+    bk.add_argument("-o", "--out", default=None)
+    bk.add_argument("--no-blobs", action="store_true", help="不备份 blob（体积小，但节点要重传）")
+    bk.set_defaults(func=cmd_backup)
+
+    rs = sub.add_parser("restore", help="把备份恢复到 hub 数据目录")
+    rs.add_argument("archive")
+    rs.add_argument("--root", default=os.path.join(os.path.expanduser("~"), ".swarm"))
+    rs.add_argument("--force", action="store_true", help="覆盖已有的 state.json")
+    rs.set_defaults(func=cmd_restore)
+
+    dl = sub.add_parser("delete", help="删除一个项目（连同它的项目目录）")
+    dl.add_argument("project")
+    _add_conn(dl, root_default=os.path.join(os.path.expanduser("~"), ".swarm"))
+    dl.set_defaults(func=cmd_delete)
+
+    dr = sub.add_parser("doctor", help="自检：连接、时钟、令牌、TLS、依赖")
+    _add_conn(dr, root_default=os.path.join(os.path.expanduser("~"), ".swarm"))
+    dr.set_defaults(func=cmd_doctor)
 
     # demo
     d = sub.add_parser("demo", help="本机起 hub + 3 个模拟节点，跑一遍完整流程")

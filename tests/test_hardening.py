@@ -810,10 +810,6 @@ class TestEndToEndHardening(unittest.TestCase):
         self.assertFalse(any(f.startswith("src/t1/") for f in tree_files(tree)))
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class TestMiscHardening(unittest.TestCase):
     def setUp(self):
         self.fx = HubFixture(use_git=False)
@@ -944,3 +940,6 @@ class TestHttpDeleteShape(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
             shutil.rmtree(d, ignore_errors=True)
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from . import DEFAULT_DISCOVERY_PORT, DEFAULT_PORT, __version__
 from . import agents, discover, proto, workspace
-from .proto import AuthError, HubClient, SwarmError
+from .proto import AuthError, ForbiddenError, HubClient, SwarmError
 from .store import BlobStore, sha256_text
 
 FETCH_WORKERS = 8
@@ -41,7 +41,8 @@ class Node(object):
     def __init__(self, root=None, hub=None, token=None, name=None, slots=2, kind="mock",
                  cmd=None, base_url=None, model=None, api_key=None, mock_delay=0.4,
                  discovery_port=DEFAULT_DISCOVERY_PORT, keep_work=False, verbose=True,
-                 verify=None):
+                 verify=None, tls=False, tls_pin=None, ca=None, insecure=False,
+                 once=False):
         self.root = os.path.abspath(root or os.path.join(os.path.expanduser("~"), ".swarm-node"))
         os.makedirs(self.root, exist_ok=True)
         self.work_root = os.path.join(self.root, "work")
@@ -62,6 +63,11 @@ class Node(object):
         self.discovery_port = int(discovery_port)
         self.keep_work = keep_work
         self.verbose = verbose
+        self.tls = bool(tls) or bool(os.environ.get("SWARM_TLS"))
+        self.tls_pin = (tls_pin or os.environ.get("SWARM_TLS_PIN") or "").strip() or None
+        self.ca = ca or os.environ.get("SWARM_CA") or None
+        self.insecure = bool(insecure) or bool(os.environ.get("SWARM_TLS_INSECURE"))
+        self.once = bool(once)
 
         self.stop = threading.Event()
         self.node_id = None
@@ -110,16 +116,29 @@ class Node(object):
                 raise SwarmError(
                     "局域网里没找到 hub。确认 hub 已启动、在同一网段，"
                     "或者用 --hub <ip:port> 直接指定。")
-            host, port, _info = found
+            host, port, info = found
             self.host, self.port = host, port
+            if info.get("tls"):
+                self.tls = True
+                self.tls_pin = self.tls_pin or info["tls"]
+                self.log("hub 启用了 TLS，用自动发现带回的指纹固定（TOFU，首次信任）%s…"
+                         % info["tls"][:16])
         else:
-            self.host, self.port = proto.parse_hub_addr(self.hub_addr, DEFAULT_PORT)
+            scheme, self.host, self.port = proto.split_hub_addr(self.hub_addr, DEFAULT_PORT)
+            if scheme == "https":
+                self.tls = True
         if not self.token:
             raise SwarmError("缺少令牌：--token 或环境变量 SWARM_TOKEN")
-        self.log("连接 hub %s:%d" % (self.host, self.port))
+        if self.tls and not (self.tls_pin or self.ca or self.insecure):
+            self.log("⚠ 启用了 TLS 但没给 --tls-pin/--ca：只加密、不校验身份。"
+                     "从 hub 启动日志里抄证书指纹，用 --tls-pin 固定更安全。")
+        self.log("连接 hub %s://%s:%d" % ("https" if self.tls else "http",
+                                          self.host, self.port))
 
     def _new_client(self):
-        c = HubClient(self.host, self.port, self.token, timeout=60)
+        c = HubClient(self.host, self.port, self.token, timeout=60,
+                      scheme="https" if self.tls else "http",
+                      tls_pin=self.tls_pin, ca=self.ca, insecure=self.insecure)
         c.node_id = self.node_id
         self._clients.append(c)
         return c
@@ -155,6 +174,8 @@ class Node(object):
         hb = threading.Thread(target=self._heartbeat_loop, name="swarm-hb", daemon=True)
         hb.start()
         self._threads.append(hb)
+        if self.once:
+            return self._run_once(client)
         for i in range(self.slots):
             t = threading.Thread(target=self._worker, args=(i,), name="swarm-slot-%d" % i, daemon=True)
             t.start()
@@ -167,6 +188,31 @@ class Node(object):
             pass
         finally:
             self.shutdown()
+        return 0
+
+    def _run_once(self, client):
+        """--once：领一个任务、干完、退出。用来验证 agent 配置是否真的能干活。"""
+        res = client.claim({"node_id": self.node_id, "slots": 1}, wait=2)
+        task = res.get("task")
+        if not task:
+            self.log("当前没有可领的任务（--once 退出）")
+            self.shutdown()
+            return 0
+        self.log("执行一次任务 %s/%s：%s" % (task.get("project"), task.get("id"),
+                                             task.get("title")))
+        try:
+            self._execute(client, task, res.get("snapshot") or [])
+        except Exception as exc:
+            self.log("任务执行失败：%s" % exc)
+            try:
+                client.fail({"node_id": self.node_id, "project": task.get("project"),
+                             "task_id": task.get("id"), "attempt": task.get("attempt"),
+                             "error": "%s: %s" % (type(exc).__name__, exc)})
+            except Exception:
+                pass
+            self.shutdown()
+            return 2
+        self.shutdown()
         return 0
 
     def _running_refs(self):
@@ -209,7 +255,7 @@ class Node(object):
                     "slots": self.slots,
                     "kinds": [self.kind],
                 })
-            except AuthError as exc:
+            except (AuthError, ForbiddenError) as exc:
                 self.log("鉴权失败（令牌被吊销？）：%s" % exc)
                 self.stop.set()
                 return
@@ -225,7 +271,7 @@ class Node(object):
         while not self.stop.is_set():
             try:
                 res = client.claim({"node_id": self.node_id, "slots": self.slots}, wait=25)
-            except AuthError as exc:
+            except (AuthError, ForbiddenError) as exc:
                 self.log("鉴权失败，停止领取：%s" % exc)
                 self.stop.set()
                 return
@@ -244,7 +290,7 @@ class Node(object):
                 continue
             try:
                 self._execute(client, task, res.get("snapshot") or [])
-            except AuthError as exc:
+            except (AuthError, ForbiddenError) as exc:
                 self.log("交付鉴权失败：%s" % exc)
                 self.stop.set()
                 return
@@ -292,15 +338,23 @@ class Node(object):
                 now = time.time()
                 if now - last[0] > 1.5:
                     last[0] = now
-                    self._flush(client, pid, tid, buf, lock)
+                    self._flush(client, pid, tid, buf, lock, attempt)
 
         try:
             self._fetch_missing(client, snapshot)
             workspace.materialize(work, None, snapshot, cache=self.cache)
 
+            feedback = str(task.get("feedback") or "").strip()
+            prompt = task.get("prompt") or task.get("title") or ""
+            if feedback:
+                prompt = (prompt + "\n\n## 上次尝试失败的原因（这次务必避开）\n\n"
+                          + feedback[:5000])
+                log_line("↺ 带上次失败反馈重试（%d 字）" % len(feedback))
             ctx = {
                 "workdir": work,
-                "prompt": task.get("prompt") or task.get("title") or "",
+                "prompt": prompt,
+                "feedback": feedback,
+                "attempt": attempt,
                 "files": task.get("write") or ["**"],
                 "file_list": [e["path"] for e in snapshot],
                 "task_id": tid,
@@ -319,7 +373,7 @@ class Node(object):
             except Exception as exc:
                 with lock:
                     buf.append("!! %s" % str(exc)[:300])
-                self._flush(client, pid, tid, buf, lock)
+                self._flush(client, pid, tid, buf, lock, attempt)
                 raise
 
             # 验收命令：任务级优先，其次节点默认 --verify
@@ -347,7 +401,8 @@ class Node(object):
             big = workspace.oversized(work)
             if big:
                 log_line("⚠ 超过 %d MB 的文件不参与同步：%s" % (
-                    8, ", ".join("%s(%.1fMB)" % (n, sz / 1048576.0) for n, sz in big[:4])))
+                    workspace.MAX_FILE >> 20,
+                    ", ".join("%s(%.1fMB)" % (n, sz / 1048576.0) for n, sz in big[:4])))
 
             for ch in changes:
                 if ch.get("deleted"):
@@ -387,14 +442,14 @@ class Node(object):
             if not self.keep_work:
                 shutil.rmtree(work, ignore_errors=True)
 
-    def _flush(self, client, pid, tid, buf, lock):
+    def _flush(self, client, pid, tid, buf, lock, attempt=None):
         with lock:
             if not buf:
                 return
             lines = buf[:]
             del buf[:]
         try:
-            client.progress(tid, lines, project=pid)
+            client.progress(tid, lines, project=pid, attempt=attempt)
         except Exception:
             pass
 
@@ -460,5 +515,8 @@ def main_from_args(args):
         base_url=args.llm_base, model=args.model, api_key=args.api_key,
         mock_delay=args.mock_delay, discovery_port=args.discovery_port,
         keep_work=args.keep_work, verify=getattr(args, "verify", None),
+        tls=getattr(args, "tls", False), tls_pin=getattr(args, "tls_pin", None),
+        ca=getattr(args, "ca", None), insecure=getattr(args, "insecure", False),
+        once=getattr(args, "once", False),
     )
     return node.run()

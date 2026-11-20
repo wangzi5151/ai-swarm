@@ -12,17 +12,31 @@
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 import shutil
+import tempfile
 
 from .store import BlobStore, is_sha, sha256_file
 
 # 这些目录永远不进快照
 IGNORE_DIRS = {".git", ".hg", ".svn", "__pycache__", "node_modules", ".gradle",
                ".idea", ".venv", "venv", "target", ".mypy_cache", ".pytest_cache"}
-IGNORE_FILES = {".DS_Store", ".swarm-task.md"}
-MAX_FILE = 8 << 20  # 单文件 8MB 以上不参与同步
+IGNORE_FILES = {".DS_Store", ".swarm-task.md", ".swarm-feedback.md"}
+
+
+def _env_max_file():
+    """单文件同步上限，默认 32MB；SWARM_MAX_FILE 可调（1MB ~ 512MB）。"""
+    raw = os.environ.get("SWARM_MAX_FILE")
+    try:
+        value = int(raw) if raw else (32 << 20)
+    except (TypeError, ValueError):
+        value = 32 << 20
+    return max(1 << 20, min(value, 512 << 20))
+
+
+MAX_FILE = _env_max_file()
 
 
 # --------------------------------------------------------------------------
@@ -374,11 +388,16 @@ def diff_work(workdir, base_entries, patterns=None, ignore=None):
         seen.add(rel)
         sha = sha256_file(full)
         if base.get(rel) != sha:
-            changes.append({"path": rel, "sha": sha, "size": os.path.getsize(full), "deleted": False})
+            changes.append({"path": rel, "sha": sha, "size": os.path.getsize(full),
+                            "mode": 0o755 if os.access(full, os.X_OK) else 0o644,
+                            "deleted": False})
     for rel in base:
         if rel in seen:
             continue
         if patterns and not match_any(rel, patterns):
+            continue
+        # 文件还在，只是新加的 .gitignore 规则把它藏起来了 —— 不能当成删除
+        if ignore is not None and ignore.ignores(rel):
             continue
         changes.append({"path": rel, "sha": None, "size": 0, "deleted": True})
     changes.sort(key=lambda c: c["path"])
@@ -392,6 +411,16 @@ def out_of_scope(changes, patterns):
     return [c["path"] for c in changes if not match_any(c["path"], patterns)]
 
 
+def _symlink_parent(root, rel):
+    """路径的任一父目录是符号链接 -> True（防止借软链写到项目外）。"""
+    cur = os.path.abspath(root)
+    for part in rel.split("/")[:-1]:
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur):
+            return True
+    return False
+
+
 def apply_change(tree, change, store):
     """把一个 change 写进项目树。返回 None 或 错误原因。"""
     rel = _safe_rel(change.get("path"))
@@ -401,6 +430,8 @@ def apply_change(tree, change, store):
     root = os.path.abspath(tree)
     if not os.path.abspath(dest).startswith(root + os.sep):
         return "路径越界"
+    if _symlink_parent(root, rel):
+        return "路径经过符号链接"
     if change.get("deleted"):
         if os.path.exists(dest):
             try:
@@ -418,7 +449,30 @@ def apply_change(tree, change, store):
     parent = os.path.dirname(dest)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    shutil.copyfile(data_path, dest)
+    # 先写同目录临时文件再原子替换：合并中途断电也不会留下半个文件。
+    # 前缀用 .tmp-，遍历项目时会自动跳过，不会被当成源码同步出去。
+    try:
+        existing_mode = os.stat(dest).st_mode & 0o777
+    except OSError:
+        existing_mode = 0o644
+    fd, tmp = tempfile.mkstemp(dir=parent or ".", prefix=".tmp-swarm-merge-")
+    try:
+        with os.fdopen(fd, "wb") as out, open(data_path, "rb") as inp:
+            shutil.copyfileobj(inp, out, 1 << 20)
+        mode = change.get("mode")
+        if not isinstance(mode, int):
+            mode = existing_mode
+        try:
+            os.chmod(tmp, mode & 0o777)
+        except OSError:
+            pass
+        os.replace(tmp, dest)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return "写入失败"
     return None
 
 
@@ -443,6 +497,91 @@ def tree_sha(tree, rel):
     if not os.path.isfile(full) or os.path.islink(full):
         return None
     return sha256_file(full)
+
+
+def is_binary(data):
+    """粗判二进制：含 NUL 或解码失败。用于决定能不能做三方文本合并。"""
+    if not data:
+        return False
+    if b"\x00" in data[:8192]:
+        return True
+    try:
+        data.decode("utf-8")
+        return False
+    except UnicodeDecodeError:
+        return True
+
+
+# --------------------------------------------------------------------------
+# 三方合并（可选）：两边改的是同一文件的不同区域 -> 自动合，重叠才交给人
+# --------------------------------------------------------------------------
+
+def _changed_blocks(base_lines, other_lines):
+    """返回 [(base_i1, base_i2, 新行列表)]。"""
+    sm = difflib.SequenceMatcher(None, base_lines, other_lines, autojunk=False)
+    out = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag != "equal":
+            out.append((i1, i2, other_lines[j1:j2]))
+    return out
+
+
+def _blocks_conflict(a, b):
+    a1, a2, alines = a
+    b1, b2, blines = b
+    if a1 == a2 and b1 == b2:
+        # 同一点各自插入：两边都保留（相同的插入去重），不算冲突
+        return False
+    if a1 == a2:                              # a 是插入
+        return b1 < a1 < b2
+    if b1 == b2:
+        return a1 < b1 < a2
+    return max(a1, b1) < min(a2, b2)
+
+
+def merge3(base, ours, theirs):
+    """文本三方合并。成功返回合并后的字符串，重叠改动返回 None。
+
+    base 是任务派发时的版本，ours 是主工程当前版本，theirs 是节点交付的版本。
+    只处理 UTF-8 文本；行尾差异交给 splitlines(True) 原样保留。
+    """
+    if ours == theirs:
+        return ours
+    if ours == base:
+        return theirs
+    if theirs == base:
+        return ours
+    b = base.splitlines(True)
+    co = _changed_blocks(b, ours.splitlines(True))
+    ct = _changed_blocks(b, theirs.splitlines(True))
+    # 两边做出了完全一样的改动不算冲突（先去掉重复事件）
+    unique = {}
+    for side, blocks in ((0, co), (1, ct)):
+        for (i1, i2, lines) in blocks:
+            unique.setdefault((i1, i2, tuple(lines)), (i1, i2, lines, side))
+    for a in co:
+        for c in ct:
+            if (a[0], a[1], tuple(a[2])) == (c[0], c[1], tuple(c[2])):
+                continue
+            if _blocks_conflict(a, c):
+                return None
+    events = list(unique.values())
+    # 同一位置的两个相同插入只保留一个；替换优先于插入
+    events.sort(key=lambda e: (e[0], 0 if e[1] == e[0] else 1, e[3]))
+    merged = []
+    pos = 0
+    prev = None
+    for i1, i2, lines, side in events:
+        if i1 < pos:
+            return None
+        if prev is not None and prev[0] == i1 and prev[1] == i2 and prev[2] == lines:
+            continue
+        merged.extend(b[pos:i1])
+        merged.extend(lines)
+        pos = i2
+        prev = (i1, i2, lines)
+    merged.extend(b[pos:])
+    return "".join(merged)
 
 
 def copy_tree(src, dst, ignore=None):

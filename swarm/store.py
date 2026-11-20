@@ -88,6 +88,8 @@ class BlobStore(object):
         return open(self.path(sha), "rb")
 
     def size(self, sha):
+        if not is_sha(sha):
+            return -1
         try:
             return os.path.getsize(self.path(sha))
         except OSError:

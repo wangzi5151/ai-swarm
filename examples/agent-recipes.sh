@@ -29,4 +29,15 @@ CMD_STDIN='cat {workdir}/.swarm-task.md | my-agent --auto'
 #    ./bin/swarm node --discover --token XXX --agent http \
 #      --llm-base http://127.0.0.1:11434/v1 --model qwen2.5-coder:14b
 
+# 9) 失败重试时，上次的错误会出现在这些地方，喂给你的 agent：
+#    - prompt 末尾（节点自动拼）
+#    - {workdir}/.swarm-feedback.md
+#    - 环境变量 SWARM_FEEDBACK
+#    - 命令模板占位符 {feedback}
+CMD_READ_FEEDBACK='cat {workdir}/.swarm-feedback.md | my-agent --prompt "{prompt}"'
+
+# 10) hub 开了 TLS：节点加 --tls-pin，或让 --discover 自动带指纹
+#    ./bin/swarm node --discover --token XXX --name 手机A \
+#      --agent cli --cmd "$CMD_AIDER" --verify 'python3 -m compileall -q src'
+
 echo "请从 $0 里挑一条，改掉 agent 名字后传给 --cmd"

@@ -71,7 +71,8 @@ def _run_streaming(cmd, cwd, timeout, env=None, log=None, max_lines=4000):
     if proc.stdout is None:
         raise AgentError("无法读取命令输出")
 
-    q = queue.Queue()
+    # 有界队列：agent 疯狂刷日志时给 stdout 反压，避免节点内存被撑爆
+    q = queue.Queue(maxsize=10000)
     closed = threading.Event()
 
     def reader():
@@ -321,6 +322,7 @@ def run_cli(ctx):
         "task_id": ctx["task_id"],
         "title": ctx.get("title", ""),
         "model": ctx.get("model") or "",
+        "feedback": ctx.get("feedback") or "",
     }
     cmd = template
     for key, val in values.items():
@@ -334,10 +336,17 @@ def run_cli(ctx):
         "SWARM_TASK_TITLE": values["title"],
         "SWARM_WORKDIR": ctx["workdir"],
         "SWARM_TASK_FILE": os.path.join(ctx["workdir"], ".swarm-task.md"),
+        "SWARM_FEEDBACK": values["feedback"],
     })
     with open(env["SWARM_TASK_FILE"], "w", encoding="utf-8") as f:
         f.write("# %s\n\n%s\n\n## 允许改动的文件\n\n%s\n" %
                 (values["title"], values["prompt"], values["file_list"] or "（未限定）"))
+        if values["feedback"]:
+            f.write("\n## 上次尝试失败的原因\n\n%s\n" % values["feedback"])
+    if values["feedback"]:
+        with open(os.path.join(ctx["workdir"], ".swarm-feedback.md"), "w",
+                  encoding="utf-8") as f:
+            f.write("# 上次尝试失败的原因\n\n%s\n" % values["feedback"])
 
     log("执行：%s" % cmd)
     timeout = int(ctx.get("timeout") or 1800)
@@ -406,6 +415,8 @@ def run_http(ctx):
         files="\n\n".join(file_list) or "（空目录，你可以新建文件）",
         scope=", ".join(ctx.get("files") or ["**"]),
     )
+    if ctx.get("feedback") and "上次尝试失败" not in prompt:
+        prompt += "\n\n上一次尝试失败的原因（这次必须避免）：\n" + str(ctx["feedback"])[:4000]
     payload = {
         "model": model,
         "temperature": 0.2,

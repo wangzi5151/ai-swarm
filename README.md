@@ -26,6 +26,9 @@
 **它不要求你在一个 App 里装多个 Linux** —— 面向**已经存在的、分散在不同机器上的 Linux 和 agent**。
 仓库里只有这一套工具：纯 Python 标准库，没有 Android 工程，不需要 Gradle、SDK 或 APK。
 
+> v1.2 起：可选 TLS（自签证书 + 指纹固定）、同一文件非重叠改动自动三方合并、
+> 重试会把上次失败原因回灌给 agent、备份/恢复 + `doctor` 自检，单文件上限提到 32MB（可调）。
+
 ---
 
 ## 一分钟先看效果
@@ -71,6 +74,22 @@ cd ai-swarm
 这比所有节点共用主令牌安全：某台手机丢了，`./bin/swarm tokens revoke 手机A`
 下一次请求就失效，其它机器不受影响。
 
+**想加密局域网流量（可选，推荐在公共 Wi-Fi 用）**：
+
+```bash
+./bin/swarm hub --root ~/.swarm --tls
+# 会自动用 openssl 生成自签证书（~/.swarm/tls/），并打印证书指纹
+```
+
+节点用 `--discover` 时会**自动带回指纹并固定**；手动连就写全：
+
+```bash
+./bin/swarm node --hub https://192.168.1.23:47770 --tls-pin <64位指纹> --token <节点令牌>
+```
+
+指纹固定能防中间人；没有 `openssl` 也可以自带证书：
+`--tls --tls-cert cert.pem --tls-key key.pem`。
+
 ### 2. 每台干活的机器跑一个节点
 
 把仓库 `git clone` 过去（或只拷 `swarm/` + `bin/swarm`），然后：
@@ -81,7 +100,7 @@ cd ai-swarm
   --verify 'python3 -m compileall -q src'
 ```
 
-- `--discover`：UDP 广播自动找 hub（找不到就用 `--hub 192.168.1.23:47770`）
+- `--discover`：UDP 广播自动找 hub（找不到就用 `--hub 192.168.1.23:47770`）；hub 开了 TLS 会自动启用
 - `--slots 2`：这台机器同时干 2 个任务
 - `--verify`：每个任务交付前在本机跑的验收命令；失败则改动**不会**进主工程
 - `--agent`：这个节点用谁干活，见下一节
@@ -112,6 +131,28 @@ cd ai-swarm
 
 `--plan` 强烈建议给：它决定每个任务能看/能改哪些路径。不给就用默认拆解，
 默认拆解只适合从零开始的新项目。hub 离线时也可以用 `--root ~/.swarm` 导入（需先停 hub）。
+
+### 6. 备份 / 迁移 / 主备
+
+```bash
+# 运行中的 hub 直接备份（state + 令牌 + 项目树 + blob），也可以 --no-blobs 只备状态
+./bin/swarm backup --hub 127.0.0.1:47770 -o backup.tar.gz
+
+# 换机/当备用机：把备份恢复到一个空目录，再在那台机器起 hub
+./bin/swarm restore backup.tar.gz --root ~/.swarm-standby --force
+./bin/swarm hub --root ~/.swarm-standby --port 47770
+```
+
+恢复出来的主令牌和节点令牌都不变，节点只需要把 `--hub` 指到新机器的 IP。
+没有做自动选主：要主备就定时 `swarm backup` 拉到备用机，主 hub 挂了再手动
+`restore` + 起 hub；**别让两个 hub 同时写同一份数据**。
+
+### 7. 自检
+
+```bash
+./bin/swarm doctor --hub 127.0.0.1:47770      # 连接、时钟偏差、权限、TLS
+./bin/swarm doctor --root ~/.swarm            # 只看本机数据目录
+```
 
 ---
 
@@ -226,6 +267,30 @@ LM Studio、vLLM、llama.cpp server、Ollama、以及各家云 API 都吃这一�
 - 失败会向上游传播：重试用尽后任务 `failed`，依赖它的任务变 `blocked`，项目进终态，
   `--watch` 会退出并告诉你去看哪条日志。
 
+### 重试不是原样重来：上次错在哪会告诉 agent
+
+任务失败/验收失败时，hub 会把错误和验收输出写进任务的 `feedback`；下一次派发时
+一起下发，节点会：
+
+- 把反馈拼在 prompt 末尾；
+- 写一份 `.swarm-feedback.md` 在工作目录；
+- 注入 `SWARM_FEEDBACK` 环境变量，命令模板里也能用 `{feedback}`。
+
+这样 agent 第二次能看到 "ImportError: xxx" 或 "测试第 3 条失败"，而不是闭着眼再写一遍。
+`.swarm-feedback.md` 和 `.swarm-task.md` 不会被当成交付内容。
+
+### 同一文件的两处改动可以自动合并
+
+默认仍然"冲突必须人裁决"。想少点手动，可以：
+
+```bash
+./bin/swarm hub --root ~/.swarm --auto-merge
+```
+
+开启后，当两个任务改了同一文件，但**改的是不重叠的行区间**，hub 会做一次三方合并
+（base / 主工程当前 / 节点版本）并直接落盘，日志里记一条 `⇄ 自动三方合并`；
+只要有一处重叠，仍然判冲突交给看板。二进制文件不自动合并。
+
 ---
 
 ## 为什么快
@@ -262,11 +327,13 @@ python3 tools/bench.py --tasks 50 --nodes 4
 
 ```bash
 ./bin/swarm hub        [--root ~/.swarm] [--port 47770] [--no-git] [--lease 180] [--stale 25]
-./bin/swarm node       --discover | --hub ip:port  --token …  [--slots 2] [--agent mock|cli|http]
-                       [--verify '验收命令'] [--keep-work]
+                       [--auto-merge] [--tls] [--tls-cert cert.pem --tls-key key.pem]
+./bin/swarm node       --discover | --hub http(s)://ip:port  --token …  [--slots 2]
+                       [--agent mock|cli|http] [--verify '验收命令'] [--keep-work] [--once]
+                       [--tls] [--tls-pin 指纹] [--ca ca.pem] [--insecure]
 ./bin/swarm submit     -f spec.md [--watch] [--plan plan.json] [--hub …] [--token …]
 ./bin/swarm import     ./已有目录 --title T [--plan plan.json] [--watch] [--root …|--hub …]
-./bin/swarm status     [--json]
+./bin/swarm status     [--json] [--watch]               # --watch 每 2 秒刷新
 ./bin/swarm logs       <project> <task>
 ./bin/swarm diff       <project> <task> <path>          # 冲突/改动差异
 ./bin/swarm rollback   <project> [--task id] [--force]
@@ -275,9 +342,16 @@ python3 tools/bench.py --tasks 50 --nodes 4
 ./bin/swarm token      [--root ~/.swarm]                # 查主令牌
 ./bin/swarm gc         [--grace 600] [--root …|--hub …] # 清理无引用 blob
 ./bin/swarm plan       -f spec.md [-o plan.json]        # 只看拆解，不派发
-./bin/swarm export     p1 -o out.tar.gz                 # 打包合并后的项目
+./bin/swarm export     <project> [--hub …] [-o out.tar.gz]   # 打包合并后的项目
+./bin/swarm backup     [--hub …|--root …] [-o backup.tar.gz] [--no-blobs]
+./bin/swarm restore    backup.tar.gz --root ~/.swarm [--force]
+./bin/swarm delete     <project> [--hub …|--root …]     # 删项目（含项目目录）
+./bin/swarm doctor     [--hub …|--root …]               # 连接/时钟/权限/TLS 自检
 ./bin/swarm demo       [--nodes 3] [--keep]
 ```
+
+所有连 hub 的命令都支持 `--tls` / `--tls-pin` / `--ca` / `--insecure`，
+也可以直接把 `--hub` 写成 `https://ip:port`。
 
 其它机器的环境变量写法（少打字）：
 
@@ -286,6 +360,13 @@ export SWARM_HUB=192.168.1.23:47770
 export SWARM_TOKEN=<节点令牌>
 export SWARM_AGENT_CMD='aider --yes --message {prompt}'
 ./bin/swarm node --discover
+
+# TLS 相关
+export SWARM_TLS=1
+export SWARM_TLS_PIN=<64位证书指纹>
+# 或 export SWARM_CA=/path/ca.pem
+# 单文件上限（默认 32MB，1MB~512MB）
+export SWARM_MAX_FILE=$((64*1024*1024))
 ```
 
 ---
@@ -329,7 +410,10 @@ mDNS 发现 + 冲突合并。
 - **跑到一半断电**：hub 状态每 3 秒落盘（有变化时），重启 hub 后未完成任务自动回队列；
   正在跑的任务会被重置为 queued，节点重连后再领。
 - **某个任务一直失败**：看板上点"重试"，或 `./bin/swarm control p1 retry --task t-api`。
-  被阻塞的任务要先重试它的上游。
+  被阻塞的任务要先重试它的上游；已完成的任务要先 `rollback` 再重试。
+  重试会自动带上一次的错误/验收输出（`feedback`），agent 能看到问题再改。
+- **合并中途出异常**：已经写进主工程的文件会自动回滚，任务重新排队，不会留下半合并状态。
+- **大仓库重启 hub**：快照哈希索引每 30 秒落盘一次，重启后不用把整个仓库重新哈希。
 - **整体暂停**：看板"暂停"，或 `./bin/swarm control p1 pause`。
 - **磁盘越来越大**：`./bin/swarm gc`（默认只删 10 分钟前、且当前无人引用的 blob）。
 - 调参：`--stale 25`（多久算掉线）、`--lease 180`（租约秒数）、`--max-attempts 2`
@@ -378,21 +462,29 @@ python3 tools/bench.py --tasks 24 --nodes 1  # 吞吐基准
 - **每节点独立令牌**：可单独吊销；节点令牌只能领/交付自己节点的任务，不能看看板、
   不能建项目、不能回滚。主令牌只留在 hub。
 - 看板：用主令牌换服务端随机会话 cookie（HttpOnly、有有效期、可注销），
-  不再把令牌写进浏览器 localStorage。
-- 网络：只面向**同一局域网**。没有做 TLS，不要暴露到公网（别做端口映射）。
+  不再把令牌写进浏览器 localStorage；页面带 CSP / X-Frame-Options / Referrer-Policy。
+- 网络：默认明文 HTTP；加 `--tls` 后 hub 用自签证书提供 HTTPS，节点可用指纹固定
+  （`--tls-pin`）或自签 CA（`--ca`）校验身份。即使不开 TLS，令牌也不会以明文传输
+  （只做 HMAC 密钥），但文件内容会。
 - 隔离是**逻辑隔离**：agent 以当前用户身份运行，能读整台机器；`write` 范围是提交后的闸门，
   防的是误改，不防恶意代码。只把令牌发给自己信任的设备。
-- 超大文件（>8MB）不参与同步（节点日志会明确提示）；二进制文件可以，但按整文件传。
+- 单文件默认上限 32MB（`SWARM_MAX_FILE` 可调，1MB~512MB）；超过的文件不同步，
+  节点日志会明确提示。二进制文件可以传，但按整文件传、不自动合并。
+- 服务端对请求体、解压体积、导入包大小都有上限；慢连接有读超时，不会被永久占住线程。
 
 ## 已知边界
 
-- 不跨网段、不走公网穿透（本来就设计成局域网协作）；单个 hub 没有主备。
+- 不跨网段、不走公网穿透（本来就设计成局域网协作）；单个 hub 没有**自动选主**，
+  但 `backup` / `restore` 可以在主 hub 挂掉后把整套状态搬到备用机（见前面"备份/迁移"）。
 - HTTP 模式依赖模型按约定返回 JSON；不守规矩的模型需要换提示词或换 `cli` 模式。
-- 合并按任务串行应用；冲突必须人工裁决一次（这是故意的，不自动猜），裁决后可以继续跑。
-- 没有任务内的多轮流式对话；现在是一任务一次交付 + 验收。
-- 大仓库首次派发会做一次全量快照（按 mtime 缓存哈希），之后只传变化。
+- 合并按任务串行应用；冲突默认人工裁决一次（这是故意的，不自动猜）。
+  `--auto-merge` 只会自动合并**不重叠**的文本改动，重叠处仍然交给人。
+- 没有任务内的多轮流式对话；现在是一任务一次交付 + 验收，失败重试会带上次的失败原因。
+- 大仓库首次派发会做一次全量快照；之后按（路径, 大小, mtime）缓存哈希并落盘，
+  重启 hub、重复派发都只重算变化的文件。
 - `.gitignore` 支持常见写法（`/` 锚定、`**`、目录尾 `/`、`!` 取反、嵌套文件）；
   被忽略目录里的反向例外不生效（与 git 的"父目录被忽略则整棵忽略"一致）。
+- Android 上后台进程仍可能被杀，建议 `termux-wake-lock` + 关电池优化（见 docs）。
 
 ---
 
@@ -410,13 +502,36 @@ python3 tools/bench.py --tasks 24 --nodes 1  # 吞吐基准
 
 | 任务 | 内容 |
 |---|---|
-| 测试 × Python 3.8 / 3.10 / 3.12 | `compileall` → 零依赖检查 → 全量 unittest |
+| 测试 × Python 3.8 / 3.10 / 3.12 / 3.13 | `compileall` → 零依赖检查 → 全量 unittest（103 个用例） |
 | demo 冒烟 | 真起 1 个 hub + 3 个节点，跑完一个完整项目 |
+| 安装冒烟 | `pip install .` 后直接跑 `swarm --version` / `swarm plan` |
 | 基准冒烟 | `tools/bench.py` 跑小规模任务图，确认调度链路没退化 |
+
+本地跑：
+
+```bash
+python3 -m unittest discover -s tests -v          # 103 个用例（TLS 用例需要 openssl）
+SWARM_TEST_UDP=1 python3 -m unittest tests.test_discover -v   # 连 UDP 广播一起
+python3 tools/check_stdlib_only.py
+python3 tools/bench.py --tasks 24 --nodes 1
+```
 
 UDP 广播发现用例默认跳过（云主机、容器常拦 `255.255.255.255`，在那种环境里跑只会误报红）；
 CI 只跑单播和回环地址的用例，本地想覆盖广播就 `SWARM_TEST_UDP=1`。
 也可以直接点开 [Actions](https://github.com/wangzi5151/ai-swarm/actions) 看最近一次结果。
+
+---
+
+## v1.2 更新了什么
+
+| 类别 | 内容 |
+|---|---|
+| 安全 | 可选 TLS（自签证书自动生成、指纹固定、自签 CA）、看板安全响应头、HTTP 读超时与请求队列上限、读 body 前先做鉴权预检、大 body 并发闸门、迟到的失败/进度回报不能影响新一轮尝试 |
+| 合并 | 同一文件非重叠改动可 `--auto-merge` 自动三方合并（两边改得一模一样也不再误判冲突）；删除类冲突可在看板/接口裁决；合并异常自动撤销已写入文件；合并前写临时文件再原子替换；文件可执行位随改动一起同步 |
+| 可靠性 | 合并历史落盘（重启后仍可 `rollback` 最近一次，且会跳过没有实际文件的冲突交付）；`merge` 部分记录边写边记；取消/结束项目清理节点占用；状态文件裁剪日志/改动记录；备份期间持锁，state 与文件一致 |
+| 重试 | 失败/验收错误作为 `feedback` 下发给下一次尝试，拼进 prompt、写 `.swarm-feedback.md`、注入 `SWARM_FEEDBACK` |
+| 性能 | 快照哈希索引落盘（重启不重算大仓库）；blob 大文件流式下发；单文件上限 8MB → 32MB（可调）；大型任务图校验/排序改成迭代式，深依赖链不爆栈 |
+| 运维 | `backup` / `restore` / `delete` / `doctor`；看板加令牌管理、完整任务日志、验收输出、项目删除/导出；`--hub https://…` 全命令可用 |
 
 ---
 

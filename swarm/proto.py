@@ -20,6 +20,7 @@ import http.client
 import json
 import os
 import socket
+import ssl
 import threading
 import time
 import urllib.parse
@@ -121,22 +122,79 @@ def decompress_limited(data, limit=MAX_UNPACKED):
 # --------------------------------------------------------------------------
 
 class HubClient(object):
-    """线程内复用的 keep-alive 连接。每个工作线程持有一个实例。"""
+    """线程内复用的 keep-alive 连接。每个工作线程持有一个实例。
 
-    def __init__(self, host, port, token, timeout=30.0):
+    scheme="https" 时走 TLS；tls_pin 是 hub 证书 DER 的 sha256（防中间人），
+    ca 是自签 CA 文件路径（启用主机名校验）。只做加密不校验时会有告警。
+    """
+
+    def __init__(self, host, port, token, timeout=30.0, scheme="http",
+                 tls_pin=None, ca=None, insecure=False):
         self.host = host
         self.port = int(port)
         self.token = token
         self.timeout = timeout
+        self.scheme = (scheme or "http").lower()
+        self.tls_pin = (tls_pin or "").strip().lower() or None
+        self.ca = ca or None
+        self.insecure = bool(insecure)
+        self.unverified = (self.scheme == "https" and not self.ca
+                           and not self.tls_pin and not self.insecure)
         self._local = threading.local()
         self._all = []
         self._all_lock = threading.Lock()
         self.node_id = None
 
     # -- 底层 ------------------------------------------------------------
+    def _ssl_context(self):
+        if self.insecure:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            return ctx
+        if self.ca:
+            ctx = ssl.create_default_context(cafile=self.ca)
+            ctx.check_hostname = True
+            return ctx
+        # 自签证书 + 指纹固定：不做 CA 链校验，但下面会核对指纹
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    def _check_pin(self, sock):
+        if self.insecure or not self.tls_pin or sock is None:
+            return
+        try:
+            der = sock.getpeercert(binary_form=True)
+        except Exception:
+            der = None
+        if not der:
+            raise SwarmError("TLS 握手后拿不到 hub 证书，无法校验指纹")
+        got = hashlib.sha256(der).hexdigest()
+        if not hmac.compare_digest(got, self.tls_pin):
+            raise SwarmError(
+                "hub 证书指纹不匹配（可能是中间人，或者 hub 换了证书）\n"
+                "  期望 %s…\n  实际 %s…\n"
+                "如果确实换了证书：用 --tls-pin %s 对应指纹，或 --insecure 临时跳过校验。"
+                % (self.tls_pin[:16], got[:16], got))
+
     def _connect(self, timeout):
-        conn = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
-        conn.connect()
+        if self.scheme == "https":
+            conn = http.client.HTTPSConnection(
+                self.host, self.port, timeout=timeout, context=self._ssl_context())
+            try:
+                conn.connect()
+                self._check_pin(conn.sock)
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                raise
+        else:
+            conn = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
+            conn.connect()
         # 局域网小包很多，关掉 Nagle：否则每个 keep-alive 请求会多等 ~40ms
         try:
             conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -253,10 +311,12 @@ class HubClient(object):
     def claim(self, payload, wait=25):
         return self.call("POST", "/api/claim?wait=%d" % wait, payload, timeout=wait + 15)
 
-    def progress(self, task_id, lines, project=None):
+    def progress(self, task_id, lines, project=None, attempt=None):
         payload = {"task_id": task_id, "lines": lines}
         if project:
             payload["project"] = project
+        if attempt is not None:
+            payload["attempt"] = attempt
         if self.node_id:
             payload["node_id"] = self.node_id
         return self.call("POST", "/api/progress", payload, timeout=10)
@@ -325,18 +385,55 @@ def _decode(data):
 # 小工具
 # --------------------------------------------------------------------------
 
-def parse_hub_addr(text, default_port):
-    """'192.168.1.5:47770' / '192.168.1.5' / '[::1]:47770' -> (host, port)"""
+def _port_number(value, default_port):
+    raw = str(value or "").strip() or str(default_port)
+    try:
+        port = int(raw)
+    except (TypeError, ValueError):
+        raise SwarmError("hub 端口不合法：%r" % (value,))
+    if not 1 <= port <= 65535:
+        raise SwarmError("hub 端口超出范围：%d" % port)
+    return port
+
+
+def split_hub_addr(text, default_port):
+    """'https://192.168.1.5:47770' -> ('https', '192.168.1.5', 47770)。
+
+    不写协议时默认 http；端口省略用 default_port。
+    """
+    text = str(text or "").strip()
     if not text:
         raise SwarmError("hub 地址为空")
+    scheme = "http"
+    if "://" in text:
+        scheme, _, text = text.partition("://")
+        scheme = scheme.lower()
+        if scheme not in ("http", "https"):
+            raise SwarmError("不支持的协议：%s（只支持 http/https）" % scheme)
+        text = text.strip()
+    text = text.rstrip("/")
+    if "/" in text:
+        raise SwarmError("hub 地址不要带路径：%r" % text)
     if text.startswith("["):
         host, _, rest = text[1:].partition("]")
+        if not host:
+            raise SwarmError("hub 地址不合法：%r" % text)
         port = rest.lstrip(":") or default_port
-        return host, int(port)
+        return scheme, host, _port_number(port, default_port)
     if text.count(":") == 1:
         host, port = text.split(":")
-        return host, int(port)
-    return text, int(default_port)
+        if not host:
+            raise SwarmError("hub 地址不合法：%r" % text)
+        return scheme, host, _port_number(port, default_port)
+    if not text:
+        raise SwarmError("hub 地址不合法")
+    return scheme, text, _port_number(default_port, default_port)
+
+
+def parse_hub_addr(text, default_port):
+    """'192.168.1.5:47770' / '192.168.1.5' / '[::1]:47770' -> (host, port)"""
+    _scheme, host, port = split_hub_addr(text, default_port)
+    return host, port
 
 
 def machine_name():

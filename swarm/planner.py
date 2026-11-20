@@ -201,7 +201,10 @@ def validate(plan_obj):
     tasks = plan_obj.get("tasks") or []
     if not isinstance(tasks, list) or not tasks:
         raise ValueError("计划里没有任务")
+    if len(tasks) > 2000:
+        raise ValueError("任务太多（上限 2000 个），请先拆成多个项目")
     ids = []
+    total_prompt = 0
     for t in tasks:
         if not isinstance(t, dict):
             raise ValueError("任务必须是 JSON 对象")
@@ -214,7 +217,24 @@ def validate(plan_obj):
         raw_deps = t.get("deps") or []
         if not isinstance(raw_deps, list):
             raise ValueError("任务 %s 的 deps 必须是数组" % tid)
+        if len(raw_deps) > 64:
+            raise ValueError("任务 %s 的依赖太多（上限 64）" % tid)
         t["deps"] = [str(d) for d in raw_deps]
+        prompt = t.get("prompt")
+        if isinstance(prompt, str):
+            size = len(prompt.encode("utf-8"))
+            if size > 200000:
+                raise ValueError("任务 %s 的 prompt 太大（上限 200KB）" % tid)
+            total_prompt += size
+            if total_prompt > (8 << 20):
+                raise ValueError("所有任务的 prompt 合计太大（上限 8MB）")
+        for key in ("read", "write"):
+            raw = t.get(key) or []
+            if not isinstance(raw, list) or len(raw) > 64:
+                raise ValueError("任务 %s 的 %s 必须是数组且不超过 64 条" % (tid, key))
+            for pat in raw:
+                if not isinstance(pat, str) or len(pat) > 200:
+                    raise ValueError("任务 %s 的 %s 里有非法 glob" % (tid, key))
         try:
             t["priority"] = int(t.get("priority") or 0)
         except (TypeError, ValueError):
@@ -244,21 +264,25 @@ def validate(plan_obj):
                 raise ValueError("任务 %s 依赖了不存在的 %s" % (t["id"], d))
         deps = [d for d in (t.get("deps") or []) if d != t["id"]]
         t["deps"] = deps
-    state = {}
-
-    def visit(tid, stack):
-        st = state.get(tid)
-        if st == 2:
-            return
-        if st == 1:
-            raise ValueError("任务图有环：%s" % " -> ".join(stack + [tid]))
-        state[tid] = 1
-        for d in _deps(tasks, tid):
-            visit(d, stack + [tid])
-        state[tid] = 2
-
-    for tid in ids:
-        visit(tid, [])
+    # 迭代式环检测（不用递归，2000 层的依赖链也不会爆栈）
+    indeg = {tid: 0 for tid in ids}
+    children = {tid: [] for tid in ids}
+    for t in tasks:
+        for d in t.get("deps") or []:
+            indeg[t["id"]] += 1
+            children[d].append(t["id"])
+    queue = [tid for tid in ids if indeg[tid] == 0]
+    seen = 0
+    while queue:
+        tid = queue.pop()
+        seen += 1
+        for child in children[tid]:
+            indeg[child] -= 1
+            if indeg[child] == 0:
+                queue.append(child)
+    if seen != len(ids):
+        stuck = sorted(tid for tid in ids if indeg[tid] > 0)
+        raise ValueError("任务图有环（涉及 %s）" % ", ".join(stuck[:8]))
     return plan_obj
 
 
@@ -270,17 +294,28 @@ def _deps(tasks, tid):
 
 
 def critical_path_order(plan_obj):
-    """给调度器一个初始优先级：依赖越深越优先（先干卡脖子的）。"""
+    """给调度器一个初始优先级：依赖越深越优先（先干卡脖子的）。
+
+    迭代式拓扑 DP，避免长依赖链触发递归深度限制。
+    """
     tasks = {t["id"]: t for t in plan_obj["tasks"]}
-
-    def depth(tid, seen=None):
-        seen = seen or set()
-        if tid in seen:
-            return 0
-        seen.add(tid)
-        deps = tasks[tid].get("deps") or []
-        return 0 if not deps else 1 + max(depth(d, seen) for d in deps)
-
+    indeg = {tid: 0 for tid in tasks}
+    children = {tid: [] for tid in tasks}
     for tid, t in tasks.items():
-        t["priority"] = max(int(t.get("priority") or 0), depth(tid))
+        for d in t.get("deps") or []:
+            if d not in tasks:
+                continue
+            indeg[tid] += 1
+            children[d].append(tid)
+    depth = {tid: 0 for tid in tasks}
+    queue = [tid for tid in tasks if indeg[tid] == 0]
+    while queue:
+        tid = queue.pop()
+        for child in children[tid]:
+            depth[child] = max(depth[child], depth[tid] + 1)
+            indeg[child] -= 1
+            if indeg[child] == 0:
+                queue.append(child)
+    for tid, t in tasks.items():
+        t["priority"] = max(int(t.get("priority") or 0), depth.get(tid, 0))
     return plan_obj
