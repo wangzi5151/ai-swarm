@@ -25,9 +25,11 @@
 
 ## 一分钟先看效果
 
-在任意一台有 Python 3.8+ 的机器上：
+零依赖（只要 Python 3.8+，不用装任何第三方包）：
 
 ```bash
+git clone https://github.com/wangzi5151/ai-swarm.git
+cd ai-swarm
 ./bin/swarm demo
 ```
 
@@ -257,7 +259,7 @@ swarm/
   cli.py         命令行
   demo.py        一条命令演示
 bin/swarm        启动器
-tests/           unittest（12 个用例，含掉线重派、冲突裁决、越界拦截）
+tests/           unittest（14 个用例，含掉线重派、冲突裁决、越界拦截）
 ```
 
 跑测试：
@@ -290,3 +292,9 @@ python3 -m unittest discover -s tests -v
 `app/` 是上一版思路（单个 Android App 内开多个虚拟工作间）的产物，可以编译出 APK，但**不是这条路线要的东西**。
 保留是为了不丢历史（旧说明在 `docs-legacy-app.md`）；新功能都在 `swarm/` 里，不需要 Gradle、不需要 Android SDK。
 如果之后想要"手机上点两下就起 hub"，可以再做一个只做进程管理 + 内嵌网页的壳，把 `swarm hub` 包进去。
+
+---
+
+## 许可证
+
+MIT，见 [LICENSE](LICENSE)。
