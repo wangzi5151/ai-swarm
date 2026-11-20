@@ -1,10 +1,17 @@
-.gradle/
-build/
-local.properties
-*.iml
-.idea/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Swarm 本地运行时数据
 .swarm/
 .swarm-node/
 *.tar.gz
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store

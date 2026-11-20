@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: 测试 · Python ${{ matrix.python }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.8", "3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 语法编译检查
+        run: python -m compileall -q swarm tests tools
+
+      - name: 零第三方依赖检查
+        run: python tools/check_stdlib_only.py
+
+      # 只用单播/回环地址的用例；UDP 广播用例需要 SWARM_TEST_UDP=1 才跑，
+      # 避免云主机或容器拦广播造成误报红。
+      - name: 单元与集成测试（不含 UDP 广播用例）
+        env:
+          SWARM_TEST_UDP: "0"
+        run: python -m unittest discover -s tests -v
+
+  demo:
+    name: 冒烟 · 端到端演示
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 准备 git 身份（demo 会真的 git commit）
+        run: |
+          git config --global user.name "swarm-ci"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+
+      - name: 起 1 个 hub + 3 个节点跑完一个项目
+        run: ./bin/swarm demo

@@ -1,5 +1,10 @@
 # Swarm —— 局域网多 AI 协同调度器
 
+[![CI](https://github.com/wangzi5151/ai-swarm/actions/workflows/ci.yml/badge.svg)](https://github.com/wangzi5151/ai-swarm/actions/workflows/ci.yml)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
+[![零第三方依赖](https://img.shields.io/badge/deps-0-brightgreen)](#环境要求)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 > 你已经在不同手机/电脑上装了不同的 agent 应用，每个应用里都有自己的 Linux 和 agent。
 > 这个工具把它们连起来：**一个大项目拆成任务图，谁空谁领，各自在自己的 Linux 里干，改动回来统一合并。**
 > 手机浏览器打开一个网页就能看全程。
@@ -18,8 +23,8 @@
       └───────────────┘ └───────────────┘ └───────────────┘
 ```
 
-**和上一版的区别**：`app/` 里那个 Android 应用是"在一个 App 内开多个虚拟工作间"，方向不对，已保留但不使用。
-现在这套东西不要求你在一个 App 里装多个 Linux —— 它面向**已经存在的、分散在不同机器上的 Linux 和 agent**。
+**它不要求你在一个 App 里装多个 Linux** —— 面向**已经存在的、分散在不同机器上的 Linux 和 agent**。
+仓库里只有这一套工具：纯 Python 标准库，没有 Android 工程，不需要 Gradle、SDK 或 APK。
 
 ---
 
@@ -33,8 +38,8 @@ cd ai-swarm
 ./bin/swarm demo
 ```
 
-它会在本机起 1 个 hub + 3 个模拟节点，把一个"记账 App"拆成 6 个任务并发跑完，
-你能看到任务流水线、文件合并、git 提交，最后打印产出目录。全过程约 13 秒。
+它会在本机起 1 个 hub + 3 个模拟节点，把一个"记账 App"拆成 7 个任务并发跑完，
+你能看到任务流水线、文件合并、git 提交，最后打印产出目录。全过程约 10 秒。
 
 ---
 
@@ -178,7 +183,7 @@ LM Studio、vLLM、llama.cpp server、Ollama、以及各家云 API 都吃这一�
 | 8 路并发拉取/推送 + keep-alive | 小文件多的时候不会一个个等 |
 | 租约 + 心跳 | 谁掉线，它手上的任务 25 秒内回到队列，不会卡死整个项目 |
 
-本机 demo 里：6 个任务、3 个节点、13 秒跑完（含两次依赖等待）。
+本机 demo 里：7 个任务、3 个节点、约 10 秒跑完（含两次依赖等待）。
 
 ---
 
@@ -259,13 +264,19 @@ swarm/
   cli.py         命令行
   demo.py        一条命令演示
 bin/swarm        启动器
-tests/           unittest（14 个用例，含掉线重派、冲突裁决、越界拦截）
+docs/            连接与部署（各类 Android Linux 的坑）
+examples/        agent 命令示例、plan 示例、需求示例
+tools/           零第三方依赖检查（CI 会跑）
+tests/           unittest（17 个用例：掉线重派、冲突裁决、越界拦截、自动发现…）
+.github/         CI：3 个 Python 版本跑测试 + demo 冒烟
 ```
 
 跑测试：
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v     # 17 个用例，约 25 秒
+SWARM_TEST_UDP=1 python3 -m unittest tests.test_discover -v   # 带上 UDP 广播用例
+python3 tools/check_stdlib_only.py           # 确认没有偷偷引入第三方包
 ```
 
 ---
@@ -287,11 +298,25 @@ python3 -m unittest discover -s tests -v
 
 ---
 
-## 和 `app/` 的关系
+## 环境要求
 
-`app/` 是上一版思路（单个 Android App 内开多个虚拟工作间）的产物，可以编译出 APK，但**不是这条路线要的东西**。
-保留是为了不丢历史（旧说明在 `docs-legacy-app.md`）；新功能都在 `swarm/` 里，不需要 Gradle、不需要 Android SDK。
-如果之后想要"手机上点两下就起 hub"，可以再做一个只做进程管理 + 内嵌网页的壳，把 `swarm hub` 包进去。
+- **Python 3.8+**，只用标准库，`pip install` 一个包都不用。
+- 能执行 shell 就行：Termux、proot-distro、UserLAnd、容器、虚拟机、普通 Linux 都一样。
+- 不需要 Android SDK、Gradle、Android Studio，也不打 APK —— 仓库里没有 Android 工程。
+- 可选：`git`（hub 合并后自动提交，能回滚；没有就加 `--no-git`）。
+
+## 测试与 CI
+
+`.github/workflows/ci.yml` 在每次 push 和 PR 自动跑：
+
+| 任务 | 内容 |
+|---|---|
+| 测试 × Python 3.8 / 3.10 / 3.12 | `compileall` → 零依赖检查 → 17 个 unittest |
+| demo 冒烟 | 真起 1 个 hub + 3 个节点，跑完一个完整项目 |
+
+UDP 广播发现用例默认跳过（云主机、容器常拦 `255.255.255.255`，在那种环境里跑只会误报红）；
+CI 只跑单播和回环地址的用例，本地想覆盖广播就 `SWARM_TEST_UDP=1`。
+也可以直接点开 [Actions](https://github.com/wangzi5151/ai-swarm/actions) 看最近一次结果。
 
 ---
 
