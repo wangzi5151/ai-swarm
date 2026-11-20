@@ -25,12 +25,21 @@ def stdlib_names():
         return set(names) | {"__future__"}
     found = set(sys.builtin_module_names) | {"__future__"}
     libdir = os.path.dirname(os.__file__)
-    for entry in os.listdir(libdir):
-        path = os.path.join(libdir, entry)
-        if entry.endswith(".py"):
-            found.add(entry[:-3])
-        elif entry.isidentifier() and os.path.exists(os.path.join(path, "__init__.py")):
-            found.add(entry)
+    # 3.8 的扩展模块（zlib、_ssl…）可能是 .so，不在顶层 .py 里，必须扫 lib-dynload
+    for directory in (libdir, os.path.join(libdir, "lib-dynload")):
+        if not os.path.isdir(directory):
+            continue
+        for entry in os.listdir(directory):
+            path = os.path.join(directory, entry)
+            if entry.endswith(".py"):
+                found.add(entry[:-3])
+            elif entry.endswith((".so", ".pyd", ".dll")):
+                base = entry.split(".", 1)[0]
+                if base.isidentifier():
+                    found.add(base)
+            elif entry.isidentifier() and os.path.isdir(path) and \
+                    os.path.exists(os.path.join(path, "__init__.py")):
+                found.add(entry)
     return found
 
 
